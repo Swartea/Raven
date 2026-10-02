@@ -1,13 +1,15 @@
 """Agent tools for the AO CodeRun adapter.
 
-Four tools, one per AO operation: ``submit``, ``status``, ``result``,
-``cancel``. They are thin wrappers over :class:`~raven_ao.adapter.CodeRunAdapter`
--- the adapter owns the decisions, these only marshal arguments and render the
-adapter's structured answer as JSON for the model.
+Five tools, one per AO operation: ``submit``, ``status``, ``result``,
+``cancel``, and ``events``. They are thin wrappers over
+:class:`~raven_ao.adapter.CodeRunAdapter` -- the adapter owns the decisions,
+these only marshal arguments and render the adapter's structured answer as JSON
+for the model.
 
-All four are controlled by ``request_id``, which is what AO's CLI takes. AO
+All five are controlled by ``request_id``, which is what AO's CLI takes. AO
 publishes a ``run_id`` on the result only, so a tool caller that has one may pass
-it, but it is never required to ask for status, a result, or a cancellation.
+it, but it is never required to ask for status, a result, a cancellation, or the
+event log.
 
 Each returns a JSON string, including on failure, so the model always receives
 the adapter's fields verbatim rather than a prose summary that could imply a
@@ -147,6 +149,29 @@ class CancelTool(_AdapterTool):
         )
 
 
+class EventsTool(_AdapterTool):
+    """Consume one incremental page of AO's durable event log."""
+
+    _action = "events"
+
+    @property
+    def name(self) -> str:
+        return "ao_code_run_events"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read the next page of agent-orchestrator's durable CodeRun event log. "
+            + _REQUEST_ID_HINT
+            + " The adapter resumes from its own stored cursor, so calling this "
+            "again returns only events after the last one consumed, and the cursor "
+            "survives a restart. Pass after_seq to resume from a specific sequence; "
+            "it is refused if it is behind the stored cursor. Returns the events as "
+            "a projection of what AO published. Events never decide acceptance or "
+            "terminal state: read result for the verdict."
+        )
+
+
 _REQUEST_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
@@ -191,6 +216,19 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
             "reason": {"type": "string", "description": "Why the run is being cancelled."},
         },
     },
+    "events": {
+        "type": "object",
+        "properties": {
+            **_IDENTITY_PROPERTIES,
+            "after_seq": {
+                "type": "integer",
+                "description": (
+                    "Resume strictly after this event sequence. Omit it to "
+                    "continue from the stored cursor."
+                ),
+            },
+        },
+    },
 }
 
 def make_adapter(ctx: Any) -> CodeRunAdapter | None:
@@ -232,13 +270,19 @@ def make_cancel_tool(ctx: Any) -> Tool | None:
     return _make_tool(ctx, CancelTool)
 
 
+def make_events_tool(ctx: Any) -> Tool | None:
+    return _make_tool(ctx, EventsTool)
+
+
 __all__ = [
     "CancelTool",
+    "EventsTool",
     "ResultTool",
     "StatusTool",
     "SubmitTool",
     "make_adapter",
     "make_cancel_tool",
+    "make_events_tool",
     "make_result_tool",
     "make_status_tool",
     "make_submit_tool",

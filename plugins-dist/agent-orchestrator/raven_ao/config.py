@@ -18,6 +18,13 @@ executable = ["python3", "-m", "orchestrator.cli"]
 A bare string is still accepted and is passed as a single argv element, so a
 configured path containing spaces reaches AO intact and no shell ever
 interprets it.
+
+``max_concurrent_code_runs`` is Raven's *outer* AO concurrency policy: how many
+AO CodeRuns this Raven deployment will hold in flight at once. It defaults to
+``1`` because a coding run owns a worktree and a supervisor, so running several
+at once is an explicit operator decision rather than a default. The limit is
+enforced by a durable guard shared by every Raven process, not by an in-process
+counter, so two Raven processes cannot each believe they hold the only slot.
 """
 
 from __future__ import annotations
@@ -29,6 +36,9 @@ from typing import Any
 from raven_ao.client import normalize_executable
 
 DEFAULT_MAPPING_DIRNAME = "agent-orchestrator"
+#: Raven's outer AO concurrency policy. One coding run at a time unless an
+#: operator raises it: each CodeRun owns a worktree and a supervisor process.
+DEFAULT_MAX_CONCURRENT_CODE_RUNS = 1
 
 
 @dataclass(frozen=True)
@@ -40,6 +50,7 @@ class AdapterConfig:
     mapping_dir: Path
     working_dir: Path | None = None
     timeout: float = 600.0
+    max_concurrent_code_runs: int = DEFAULT_MAX_CONCURRENT_CODE_RUNS
 
 
 class ConfigError(RuntimeError):
@@ -123,7 +134,37 @@ def resolve_config(ctx: Any) -> AdapterConfig:
         mapping_dir=_default_mapping_dir(configured),
         working_dir=Path(working_dir).expanduser() if working_dir else None,
         timeout=timeout_value,
+        max_concurrent_code_runs=_max_concurrent(configured),
     )
 
 
-__all__ = ["AdapterConfig", "ConfigError", "DEFAULT_MAPPING_DIRNAME", "resolve_config"]
+def _max_concurrent(configured: dict[str, Any]) -> int:
+    """Read the outer AO concurrency limit, defaulting to one active run.
+
+    A boolean is rejected explicitly: ``True`` is an ``int`` in Python, so
+    without this an operator writing ``true`` would silently get a limit of one
+    rather than being told their config is wrong.
+    """
+    raw = configured.get("max_concurrent_code_runs")
+    if raw is None:
+        return DEFAULT_MAX_CONCURRENT_CODE_RUNS
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(
+            "agent-orchestrator 'max_concurrent_code_runs' must be an integer "
+            f"of at least 1, got {raw!r}"
+        )
+    if raw < 1:
+        raise ConfigError(
+            "agent-orchestrator 'max_concurrent_code_runs' must be at least 1, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
+__all__ = [
+    "AdapterConfig",
+    "ConfigError",
+    "DEFAULT_MAPPING_DIRNAME",
+    "DEFAULT_MAX_CONCURRENT_CODE_RUNS",
+    "resolve_config",
+]

@@ -1,6 +1,6 @@
 """Direct ``argv`` invocation of the agent-orchestrator ``code-run-*`` CLI.
 
-The four operations map onto AO's own subcommands, and the command surface is
+The five operations map onto AO's own subcommands, and the command surface is
 transcribed from AO rather than assumed:
 
 ===========================  =========================================
@@ -8,12 +8,20 @@ transcribed from AO rather than assumed:
 ``code-run-status``          positional ``REQUEST_ID``
 ``code-run-result``          positional ``REQUEST_ID``
 ``code-run-cancel``          positional ``REQUEST_ID`` plus ``--reason``
+``code-run-events``          positional ``REQUEST_ID`` plus ``--after-seq N``
 ===========================  =========================================
 
 There is no ``--json`` flag, no generic ``submit``/``status`` command, and no
 ``run_id`` argument. Control is by ``request_id`` on every operation *including*
-status, result and cancel, and AO answers all three from durable state, so a
-process that did not submit the run drives it exactly like the one that did.
+status, result, cancel and events, and AO answers all four from durable state, so
+a process that did not submit the run drives it exactly like the one that did.
+
+``code-run-events`` is an *incremental* read: it takes a positional
+``REQUEST_ID`` and an ``--after-seq N`` cursor and returns only the events whose
+sequence is strictly greater than ``N``. The cursor is exclusive, so a reader
+that stores the highest sequence it has consumed never re-reads an event and
+never skips one across a restart. AO numbers its log from ``0``, which is why
+the first page is requested with ``--after-seq -1``.
 
 ``code-run-submit`` reads the whole ``CodeRunRequest`` from a **file**, not from
 stdin, so the request is written to a private temporary file and passed by path.
@@ -40,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Sequence
 
+from raven_ao.mapping import CURSOR_BEFORE_FIRST_EVENT
+
 DEFAULT_TIMEOUT_SECONDS: Final = 600.0
 
 #: AO's exact subcommand names. Anything else is not this CLI.
@@ -47,9 +57,10 @@ COMMAND_SUBMIT: Final = "code-run-submit"
 COMMAND_STATUS: Final = "code-run-status"
 COMMAND_RESULT: Final = "code-run-result"
 COMMAND_CANCEL: Final = "code-run-cancel"
+COMMAND_EVENTS: Final = "code-run-events"
 
 AO_COMMANDS: Final = frozenset(
-    {COMMAND_SUBMIT, COMMAND_STATUS, COMMAND_RESULT, COMMAND_CANCEL}
+    {COMMAND_SUBMIT, COMMAND_STATUS, COMMAND_RESULT, COMMAND_CANCEL, COMMAND_EVENTS}
 )
 
 
@@ -217,10 +228,25 @@ class AoCliClient:
             argv += ["--reason", reason]
         return await self._invoke(argv, COMMAND_CANCEL)
 
+    async def events(self, request_id: str, after_seq: int = CURSOR_BEFORE_FIRST_EVENT) -> CliResult:
+        """Read one incremental page of AO's durable event log.
+
+        ``--after-seq`` is exclusive, and AO numbers its log from ``0``, so the
+        default ``-1`` is what asks for the first page: it offers event ``0``
+        rather than skipping it. A resumed reader passes the highest sequence it
+        has already consumed to continue strictly past it. The value is rendered
+        as a plain decimal integer, never as a flag that could carry anything but
+        a sequence number.
+        """
+        argv = self._command_argv(COMMAND_EVENTS, request_id)
+        argv += ["--after-seq", str(int(after_seq))]
+        return await self._invoke(argv, COMMAND_EVENTS)
+
 
 __all__ = [
     "AO_COMMANDS",
     "COMMAND_CANCEL",
+    "COMMAND_EVENTS",
     "COMMAND_RESULT",
     "COMMAND_STATUS",
     "COMMAND_SUBMIT",

@@ -362,6 +362,45 @@ class TestFlagsAndSchema:
 # ---------------------------------------------------------------------------
 
 
+class TestAgentOrchestratorManifest:
+    """The AO adapter's own manifest, which grew an events tool and an outer
+    concurrency key. Read from the shipped file so the declaration and the
+    plugin's behaviour cannot drift apart silently."""
+
+    def _manifest(self) -> PluginManifest:
+        path = (
+            Path(__file__).parents[1]
+            / "plugins-dist"
+            / "agent-orchestrator"
+            / "raven_ao"
+            / "raven-plugin.toml"
+        )
+        return PluginManifest.from_toml_path(path)
+
+    def test_events_tool_is_contributed_alongside_the_four_originals(self) -> None:
+        mf = self._manifest()
+        names = [tool.name for tool in mf.contributes.tools]
+        assert names == [
+            "ao_code_run_submit",
+            "ao_code_run_status",
+            "ao_code_run_result",
+            "ao_code_run_cancel",
+            "ao_code_run_events",
+        ]
+        assert len(set(names)) == len(names)
+
+    def test_every_contribution_resolves_to_the_plugin_package(self) -> None:
+        mf = self._manifest()
+        assert all(
+            tool.factory.startswith("raven_ao.tools:") for tool in mf.contributes.tools
+        )
+        assert any(tool.factory.endswith("make_events_tool") for tool in mf.contributes.tools)
+
+    def test_outer_concurrency_key_is_declared_as_an_integer(self) -> None:
+        mf = self._manifest()
+        assert mf.config_schema["max_concurrent_code_runs"] == {"type": "integer"}
+
+
 class TestFromTomlPath:
     def test_reads_file(self, tmp_path: Path) -> None:
         path = tmp_path / "raven-plugin.toml"

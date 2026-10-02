@@ -427,6 +427,54 @@ def test_build_onboard_step_calls_the_factory(tmp_path: Path) -> None:
     assert step == ("step", {"k": 1})
 
 
+def test_ao_manifest_contributes_five_tools_and_its_config_key() -> None:
+    """The AO adapter contributes one tool per AO operation, events included.
+
+    Parsed from the shipped file so a contribution that no longer declares a
+    resolvable factory, or a name that collides, is caught here rather than at
+    first tool call.
+    """
+    from raven.plugins.manifest import PluginManifest
+
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "plugins-dist"
+        / "agent-orchestrator"
+        / "raven_ao"
+        / "raven-plugin.toml"
+    )
+    mf = PluginManifest.from_toml_path(manifest_path)
+    assert [tool.name for tool in mf.contributes.tools] == [
+        "ao_code_run_submit",
+        "ao_code_run_status",
+        "ao_code_run_result",
+        "ao_code_run_cancel",
+        "ao_code_run_events",
+    ]
+    assert all(
+        tool.factory.startswith("raven_ao.tools:") for tool in mf.contributes.tools
+    )
+    assert mf.config_schema["max_concurrent_code_runs"] == {"type": "integer"}
+
+
+def test_ao_tool_names_stay_unique_within_the_manifest() -> None:
+    """Tool-name uniqueness is enforced within each kind, so a duplicated
+    events contribution is rejected at parse time rather than silently
+    shadowing the first one."""
+    from raven.plugins.manifest import PluginManifest
+
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "plugins-dist"
+        / "agent-orchestrator"
+        / "raven_ao"
+        / "raven-plugin.toml"
+    )
+    mf = PluginManifest.from_toml_path(manifest_path)
+    names = [tool.name for tool in mf.contributes.tools]
+    assert len(names) == len(set(names)) == 5
+
+
 def test_build_onboard_step_rejects_an_unknown_name(tmp_path: Path) -> None:
     reg = PluginRegistry()
     with pytest.raises(PluginNotFoundError):

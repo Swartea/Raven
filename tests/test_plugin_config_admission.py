@@ -8,6 +8,7 @@ valid configs while going loud on invalid ones.
 """
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -115,6 +116,39 @@ def test_everos_declaration_is_zero_behavior_for_valid_config(tmp_path):
     assert admit_slice(schema, recorded, plugin_id="everos-memory") == recorded
     with pytest.raises(PluginConfigError):
         admit_slice(schema, {"owned": "yes"}, plugin_id="everos-memory")
+
+
+def test_ao_outer_concurrency_key_is_admitted_at_the_door(tmp_path: Path) -> None:
+    """The AO plugin's concurrency policy is type-checked like any other key.
+
+    The limit is declared without a default so the factory keeps owning the
+    value: an absent key admits as unset and the factory falls back to one,
+    while a boolean -- which would otherwise pass as an int in Python -- is
+    refused outright.
+    """
+    from raven.plugins.manifest import PluginManifest
+
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "plugins-dist"
+        / "agent-orchestrator"
+        / "raven_ao"
+        / "raven-plugin.toml"
+    )
+    schema = PluginManifest.from_toml_path(manifest_path).config_schema
+    assert schema["max_concurrent_code_runs"] == {"type": "integer"}
+
+    plugin_id = "agent-orchestrator"
+    assert admit_slice(schema, {}, plugin_id=plugin_id) == {}
+    assert admit_slice(schema, {"max_concurrent_code_runs": 2}, plugin_id=plugin_id) == {
+        "max_concurrent_code_runs": 2
+    }
+    with pytest.raises(PluginConfigError, match="got boolean"):
+        admit_slice(schema, {"max_concurrent_code_runs": True}, plugin_id=plugin_id)
+    with pytest.raises(PluginConfigError, match="must be integer"):
+        admit_slice(schema, {"max_concurrent_code_runs": "2"}, plugin_id=plugin_id)
+    with pytest.raises(PluginConfigError, match="must be string"):
+        admit_slice(schema, {"runs_dir": 9}, plugin_id=plugin_id)
 
 
 def test_container_types_are_shape_checked_at_the_door():

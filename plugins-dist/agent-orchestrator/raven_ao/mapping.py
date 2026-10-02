@@ -1,17 +1,25 @@
 """Durable local mapping from a Raven coding step to its AO CodeRun.
 
 One file per ``request_id`` under the configured mapping directory, holding the
-parent identifiers, the request fingerprint, and the AO ``run_id`` once AO has
-published one. The store is the adapter's *only* memory: it holds no AO task
-state, no attempt DAG, and no execution progress. Everything about how the run
-is going is asked of AO; this file only answers "which ``request_id`` controls
-this Raven step?".
+parent identifiers, the request fingerprint, the AO ``run_id`` once AO has
+published one, and the highest AO event sequence Raven has consumed. The store
+is the adapter's *only* memory: it holds no AO task state, no attempt DAG, no
+execution progress, and no run history. Everything about how the run is going is
+asked of AO; this file only answers "which ``request_id`` controls this Raven
+step, and how far into AO's event log have I already read?".
 
 ``request_id`` is the control key on every AO operation, so a record that has no
 ``run_id`` yet is still complete: ``run_id`` is a label AO publishes later, not
 a prerequisite for driving the run.
 
-Two properties matter and are both tested:
+``last_seen_event_seq`` is a *consumer cursor*, not run state. AO owns the event
+log and is the only source of what happened; Raven stores nothing but the
+position it has read to, so a restarted process resumes with a request for
+sequences strictly greater than the cursor and neither re-reads nor skips an
+event. The cursor is never allowed to move backwards, and it is advanced only
+after a validated page is accepted -- an unreadable page leaves it untouched.
+
+Three properties matter and are all tested:
 
 *Atomicity* -- a record is written to a temp file in the same directory and
 installed with :func:`os.replace`, so a reader never observes a half-written
@@ -20,6 +28,11 @@ record, and a crash mid-write leaves the previous record intact.
 *Cross-process safety* -- mutating operations take an exclusive
 :func:`fcntl.flock` on a per-record lock file, so two Raven processes racing on
 the same parent step serialize instead of interleaving writes.
+
+*Monotonic cursor advance* -- :meth:`MappingStore.advance_event_cursor` performs
+its read-modify-write under that same lock and refuses any sequence that is not
+strictly greater than the stored cursor, so concurrent consumers of one request
+can only ever move the cursor forward.
 """
 
 from __future__ import annotations
@@ -41,8 +54,19 @@ from typing import Any, Iterator
 STATE_RESERVED: str = "reserved"
 STATE_SUBMITTED: str = "submitted"
 STATE_CANCEL_REQUESTED: str = "cancel_requested"
+#: AO has explicitly reported that the request behind this mapping no longer
+#: exists. This is an observable, recoverable condition -- not a failure and not
+#: a verdict about the run -- and it is recorded durably so a later submit does
+#: not blindly relaunch a request AO has already forgotten.
+STATE_STALE_MAPPING: str = "stale_mapping"
 
 TERMINAL_RAVEN_STATES: frozenset[str] = frozenset()
+
+#: The cursor value that precedes every AO event. AO numbers its durable event
+#: log from ``0`` and its ``code-run-events --after-seq`` default is ``-1``, so a
+#: fresh (or legacy, cursor-less) reader must start at ``-1`` to be offered event
+#: ``0``. Starting at ``0`` would silently skip the first event of every run.
+CURSOR_BEFORE_FIRST_EVENT: int = -1
 
 
 class MappingCorruptError(RuntimeError):
@@ -88,6 +112,7 @@ class RunMapping:
     run_id: str | None = None
     state: str = STATE_RESERVED
     cancel_requested: bool = False
+    last_seen_event_seq: int = CURSOR_BEFORE_FIRST_EVENT
     submitted_at: str | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -136,6 +161,15 @@ class MappingStore:
         safe = request_id.replace(os.sep, "_").replace("/", "_")
         return self._root / f"{safe}.lock"
 
+    def _control_lock_for(self, request_id: str) -> Path:
+        # Deliberately a *different* file from the record lock. The record lock
+        # guards one read-modify-write of the mapping; the control lock guards a
+        # whole AO submit/control call sequence that takes the record lock
+        # several times inside it. Reusing one file would make the nested
+        # acquisition self-deadlock, since flock is held per open description.
+        safe = request_id.replace(os.sep, "_").replace("/", "_")
+        return self._root / f"{safe}.control.lock"
+
     @contextmanager
     def _locked(self, request_id: str) -> Iterator[None]:
         self._root.mkdir(parents=True, exist_ok=True)
@@ -149,6 +183,33 @@ class MappingStore:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+    def try_acquire_control(self, request_id: str) -> tuple[int, bool]:
+        """Try to take this request's control lock without blocking.
+
+        Returns ``(fd, acquired)``. Non-blocking on purpose: the caller holds an
+        event loop and drives AO asynchronously, and a blocking :func:`flock`
+        would freeze that loop for every other coroutine while it waits -- a
+        waiter must be able to keep running the lock holder. The caller releases
+        with :meth:`release_control` and may poll until it succeeds.
+        """
+        self._root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._control_lock_for(request_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return -1, False
+        return fd, True
+
+    def release_control(self, fd: int) -> None:
+        """Release a lock file descriptor taken by :meth:`try_acquire_control`."""
+        if fd < 0:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _read_unlocked(self, request_id: str) -> RunMapping | None:
         path = self._path_for(request_id)
@@ -167,6 +228,11 @@ class MappingStore:
                 "refusing to overwrite it"
             )
         known = {f: raw.get(f) for f in RunMapping.__dataclass_fields__ if f in raw}
+        if known.get("last_seen_event_seq") is None:
+            # A record written before the cursor existed has read nothing, and
+            # "nothing read" is -1 rather than 0: AO's first event is sequence 0,
+            # so a 0 default would skip it forever.
+            known["last_seen_event_seq"] = CURSOR_BEFORE_FIRST_EVENT
         try:
             return RunMapping(**known)  # type: ignore[arg-type]
         except TypeError as exc:
@@ -232,12 +298,156 @@ class MappingStore:
             self._write_atomic(existing)
             return existing
 
+    def advance_event_cursor(
+        self, request_id: str, sequence: int, *, run_id: str | None = None
+    ) -> RunMapping | None:
+        """Move the event cursor forward to ``sequence``, never backwards.
+
+        The read-modify-write happens under the record's exclusive lock, so two
+        Raven processes consuming the same request serialize: the loser reads
+        the winner's advanced cursor and, if its own sequence is no longer
+        strictly greater, the advance is refused instead of rewinding the
+        cursor and causing the winner's range to be replayed.
+
+        ``run_id`` is a run identity AO may publish for the first time on the
+        very page that advances the cursor. It is written in the *same* locked
+        read-modify-write rather than as a separate update, because the pair is
+        one event position: a crash between two writes could otherwise leave a
+        durable cursor attributed to no run, or a run whose cursor never moved.
+        An existing ``run_id`` is never overwritten, and is never replaced by a
+        value the page did not publish.
+
+        Returns the record as it now stands, or ``None`` when no mapping exists
+        (there is nothing to advance). Refusal is not an error: a caller that
+        loses the race simply reports the cursor that is already ahead.
+        """
+        with self._locked(request_id):
+            existing = self._read_unlocked(request_id)
+            if existing is None:
+                return None
+            learned_run_id = (
+                isinstance(run_id, str) and run_id.strip() and existing.run_id is None
+            )
+            if sequence <= existing.last_seen_event_seq and not learned_run_id:
+                return existing
+            if sequence > existing.last_seen_event_seq:
+                existing.last_seen_event_seq = sequence
+            if learned_run_id:
+                existing.run_id = run_id
+            existing.updated_at = _now()
+            self._write_atomic(existing)
+            return existing
+
+
+class CapacityGuard:
+    """Durable, cross-process cap on concurrently active AO CodeRuns.
+
+    Raven's *outer* concurrency policy: how many AO CodeRuns this Raven
+    deployment will have in flight at once, independent of whatever AO's own
+    internal dispatch parallelism happens to be. Capacity is claimed before a
+    launch and released only once AO itself has confirmed the run can no longer
+    consume it -- an authoritative terminal status/result, or AO confirming the
+    request no longer exists. A run that is merely quiet, or that Raven has not
+    yet been told anything about, keeps its slot.
+
+    The guard is a set of empty marker files under ``active`` inside the mapping
+    directory, one per active ``request_id``, plus a single guard lock. Because
+    the count is derived from the directory rather than from a counter in
+    memory, a Raven process that dies holding a slot does not permanently inflate
+    the count in a way another process cannot see or reclaim.
+    """
+
+    #: Marker files are named after the request id, which is adapter-derived hex.
+    _SUFFIX: str = ".active"
+
+    def __init__(self, directory: str | os.PathLike[str]) -> None:
+        self._root = Path(directory).expanduser()
+        self._active = self._root / "active"
+        self._lock_path = self._root / "capacity.lock"
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def active_dir(self) -> Path:
+        return self._active
+
+    def _marker_for(self, request_id: str) -> Path:
+        safe = request_id.replace(os.sep, "_").replace("/", "_")
+        return self._active / f"{safe}{self._SUFFIX}"
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._active.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def active_count(self) -> int:
+        """How many CodeRuns currently hold a slot, across all processes."""
+        if not self._active.exists():
+            return 0
+        return sum(1 for _ in self._active.glob(f"*{self._SUFFIX}"))
+
+    def active_request_ids(self) -> list[str]:
+        if not self._active.exists():
+            return []
+        return sorted(
+            path.name[: -len(self._SUFFIX)] for path in self._active.glob(f"*{self._SUFFIX}")
+        )
+
+    def acquire(self, request_id: str, limit: int) -> tuple[bool, int]:
+        """Claim a slot for ``request_id`` when fewer than ``limit`` are active.
+
+        Returns ``(acquired, active_count)``. Re-acquiring a slot this request
+        already holds is a no-op that still succeeds, so a resubmit or reconnect
+        of the same run can never be blocked by its own earlier claim.
+        """
+        if limit < 1:
+            return False, self.active_count()
+        with self._locked():
+            marker = self._marker_for(request_id)
+            if marker.exists():
+                return True, self.active_count()
+            if self.active_count() >= limit:
+                return False, self.active_count()
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+            return True, self.active_count()
+
+    def holds(self, request_id: str) -> bool:
+        return self._marker_for(request_id).exists()
+
+    def release(self, request_id: str) -> bool:
+        """Give back ``request_id``'s slot. Returns whether one was held.
+
+        Releasing a slot that is not held is not an error: the run is no longer
+        active either way, and the caller's intent is satisfied.
+        """
+        with self._locked():
+            try:
+                self._marker_for(request_id).unlink()
+                return True
+            except FileNotFoundError:
+                return False
+
 
 __all__ = [
+    "CURSOR_BEFORE_FIRST_EVENT",
+    "CapacityGuard",
     "MappingStore",
     "RunMapping",
     "STATE_CANCEL_REQUESTED",
     "STATE_RESERVED",
+    "STATE_STALE_MAPPING",
     "STATE_SUBMITTED",
     "derive_request_id",
     "fingerprint_request",
