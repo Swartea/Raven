@@ -30,7 +30,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 SCHEMA_VERSION = 1
@@ -65,6 +65,7 @@ COMPLETION_CLAIMS = ("completed", "complete", "done", "passed")
 _RELATION_PREFIX = re.compile(r"^\s*[-*\d.]+\s*")
 _PROGRESS_HEADING = re.compile(r"^\s*(?:#{1,6}\s+)?(session|round|progress|step)\b", re.I)
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_EMBEDDED_HOST_PATH = re.compile(r"(?<![\w:])(?:/Users/|/private/|/home/|/tmp/|/var/folders/|/Volumes/)[^\s\"'<>]+")
 
 
 class MigrationError(RuntimeError):
@@ -85,6 +86,38 @@ def _sha256(data: bytes) -> str:
 
 def _read_bytes(path: Path) -> bytes:
     return path.read_bytes()
+
+
+def _sanitize_record_paths(value: Any, source: Path) -> tuple[Any, bool]:
+    """Keep outcome data while preventing host-specific absolute paths from escaping."""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            sanitized[key], item_changed = _sanitize_record_paths(item, source)
+            changed |= item_changed
+        return sanitized, changed
+    if isinstance(value, list):
+        sanitized_items = [_sanitize_record_paths(item, source) for item in value]
+        return [item for item, _ in sanitized_items], any(changed for _, changed in sanitized_items)
+    if not isinstance(value, str):
+        return value, False
+
+    text = value
+    candidate = Path(text).expanduser()
+    windows_absolute = PureWindowsPath(text).is_absolute()
+    if candidate.is_absolute() or windows_absolute:
+        if windows_absolute and not candidate.is_absolute():
+            text = f"<redacted-absolute-path:{PureWindowsPath(text).name or 'path'}>"
+        else:
+            try:
+                relative = candidate.resolve(strict=False).relative_to(source.resolve())
+            except (OSError, ValueError):
+                text = f"<redacted-absolute-path:{candidate.name or 'path'}>"
+            else:
+                text = relative.as_posix()
+    scrubbed = _EMBEDDED_HOST_PATH.sub("<redacted-absolute-path>", text)
+    return scrubbed, scrubbed != value
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -467,13 +500,17 @@ def read_source(
             raw_outcome = _read_bytes(record_path)
             checksums[relative] = _sha256(raw_outcome)
             try:
+                raw_record = json.loads(raw_outcome.decode("utf-8"))
+                safe_record, redacted_paths = _sanitize_record_paths(raw_record, source)
                 outcomes.append(
                     parse_outcome_record(
-                        json.loads(raw_outcome.decode("utf-8")),
+                        safe_record,
                         source_path=relative,
                         source_kind=kind,
                     )
                 )
+                if redacted_paths:
+                    warnings.append(f"absolute host paths were redacted in {relative}")
             except (UnicodeDecodeError, ValueError) as error:
                 raise MigrationError(f"session outcome {relative} is not valid JSON: {error}") from error
         if kind == "legacy":
