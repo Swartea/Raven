@@ -94,8 +94,9 @@ def _sanitize_record_paths(value: Any, source: Path) -> tuple[Any, bool]:
         sanitized: dict[str, Any] = {}
         changed = False
         for key, item in value.items():
-            sanitized[key], item_changed = _sanitize_record_paths(item, source)
-            changed |= item_changed
+            safe_key, key_changed = _sanitize_record_paths(key, source) if isinstance(key, str) else (key, False)
+            sanitized[safe_key], item_changed = _sanitize_record_paths(item, source)
+            changed |= key_changed or item_changed
         return sanitized, changed
     if isinstance(value, list):
         sanitized_items = [_sanitize_record_paths(item, source) for item in value]
@@ -300,7 +301,8 @@ class RelayMigrationManifest:
         try:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
-            raise MigrationError(f"could not read manifest {path}: {error}") from error
+            detail = error.strerror if isinstance(error, OSError) else str(error)
+            raise MigrationError(f"could not read manifest: {detail or 'invalid JSON'}") from error
         return cls.from_dict(raw)
 
     def dump(self) -> str:
@@ -447,7 +449,7 @@ def read_source(
     """Read every Relay input. Returns work items, progress, outcomes, spec, and checksums."""
     source = Path(source).expanduser()
     if not source.is_dir():
-        raise MigrationError(f"Relay source {source} is not a directory")
+        raise MigrationError("Relay source is not a directory")
     warnings: list[str] = []
     checksums: dict[str, str] = {}
     raw_progress = ""
@@ -549,7 +551,7 @@ def build_manifest(
     """Snapshot a Relay repository into a manifest without writing to it."""
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
-        raise MigrationError(f"Relay source {source} is not a directory")
+        raise MigrationError("Relay source is not a directory")
 
     work_items, entries, outcomes, spec_text, raw_progress, checksums, warnings = read_source(source)
     created = created_at or _utc_now()
@@ -656,7 +658,7 @@ def detect_drift(manifest: RelayMigrationManifest, source: Path) -> list[str]:
     """What changed in the source since the manifest was built."""
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
-        raise MigrationError(f"Relay source {source} is not a directory")
+        raise MigrationError("Relay source is not a directory")
     drift: list[str] = []
     head = _git(source, "rev-parse", "HEAD") or ""
     if manifest.source_head and head != manifest.source_head:
@@ -850,7 +852,7 @@ def plan_import(manifest: RelayMigrationManifest, target: Path, *, source: Path 
         if str(entry.get("reason", entry.get("note", ""))).startswith("relay-migration:")
     }
 
-    plan = _new_plan(manifest.migration_id, str(target))
+    plan = _new_plan(manifest.migration_id, "selected target project")
     for item in manifest.work_items:
         planned = map_work_item(item, manifest.provenance)
         if planned["marker"] in markers:
@@ -862,10 +864,10 @@ def plan_import(manifest: RelayMigrationManifest, target: Path, *, source: Path 
     plan["failures"] = [outcome for outcome in plan["outcomes"] if _is_failure(outcome)]
     receipt_root = RECEIPT_DIR / manifest.migration_id
     plan["writes"] = [
-        str(module.backlog_path(target)),
-        str(target / _journal_module().JOURNAL),
-        str(target / receipt_root / RECEIPT_FILE),
-        str(target / receipt_root / "manifest.json"),
+        module.backlog_path(target).relative_to(target).as_posix(),
+        Path(_journal_module().JOURNAL).as_posix(),
+        (receipt_root / RECEIPT_FILE).as_posix(),
+        (receipt_root / "manifest.json").as_posix(),
     ]
     return plan
 

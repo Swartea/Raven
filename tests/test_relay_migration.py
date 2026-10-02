@@ -283,6 +283,9 @@ def test_dry_run_writes_nothing(relay_repo, target_project):
     assert report["progress_entries"] == 2
     assert report["source_commits"] == 1
     assert "feature_list.json" in manifest.source_commits[0]["files"]
+    assert plan["target"] == "selected target project"
+    assert all(not Path(write).is_absolute() for write in plan["writes"])
+    assert str(target_project) not in repr(plan)
     assert _tree_snapshot(target_project) == before
     assert rm.main(["--source", str(relay_repo), "--target", str(target_project)]) == 0
 
@@ -444,6 +447,7 @@ def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_re
         "embedded_windows_path": r"failure at C:\private\secret\session.log",
         "embedded_posix_path": "see /etc/secret/session.log",
     }
+    outcome["/Users/alice/private/absolute-key"] = "sensitive value"
     _write_json(outcome_path, outcome)
     feature_path = relay_repo / "feature_list.json"
     features = json.loads(feature_path.read_text(encoding="utf-8"))
@@ -461,6 +465,7 @@ def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_re
     assert captured["source_record"]["debug"]["windows_path"].startswith("<redacted-absolute-path:")
     assert "C:\\private\\secret" not in json.dumps(captured)
     assert "/etc/secret" not in json.dumps(captured)
+    assert "/Users/alice/private/absolute-key" not in json.dumps(captured)
     assert manifest.work_items[0]["source_record"]["debug_path"].startswith("<redacted-absolute-path:")
     assert all("/etc/secret" not in commit["message"] for commit in manifest.source_commits)
     assert all("C:\\private\\session.log" not in commit["message"] for commit in manifest.source_commits)
@@ -468,6 +473,18 @@ def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_re
     assert "/Users/alice/" not in manifest.dump()
     assert outcome_path.relative_to(relay_repo).as_posix() in manifest.checksums
     assert len([warning for warning in manifest.warnings if "absolute host paths were redacted" in warning]) == 3
+
+
+def test_path_diagnostics_do_not_echo_host_paths(tmp_path):
+    missing_source = tmp_path / "private source"
+    with pytest.raises(rm.MigrationError) as source_error:
+        rm.build_manifest(missing_source)
+    assert str(missing_source) not in str(source_error.value)
+
+    missing_manifest = tmp_path / "private manifest.json"
+    with pytest.raises(rm.MigrationError) as manifest_error:
+        rm.RelayMigrationManifest.load(missing_manifest)
+    assert str(missing_manifest) not in str(manifest_error.value)
 
 
 def test_edited_manifest_payload_is_rejected_before_import(relay_repo, target_project):
