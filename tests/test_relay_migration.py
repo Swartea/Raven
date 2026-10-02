@@ -230,6 +230,19 @@ def test_manifest_rejects_a_foreign_schema(relay_repo):
         rm.RelayMigrationManifest.from_dict(payload)
 
 
+def test_manifest_rejects_absolute_and_traversing_checksum_paths(relay_repo, tmp_path):
+    manifest_data = rm.build_manifest(relay_repo).to_dict()
+    outside_file = tmp_path / "outside-secret.txt"
+    outside_file.write_text("must not be read", encoding="utf-8")
+
+    for invalid_path in ("../outside-secret.txt", str(outside_file), r"C:\Users\alice\private.txt"):
+        payload = dict(manifest_data)
+        payload["checksums"] = dict(manifest_data["checksums"])
+        payload["checksums"][invalid_path] = "0" * 64
+        with pytest.raises(rm.MigrationError, match="normalized relative POSIX path"):
+            rm.RelayMigrationManifest.from_dict(payload)
+
+
 def test_source_identity_is_not_a_host_path(relay_repo):
     manifest = rm.build_manifest(relay_repo)
     assert "/" not in manifest.source_repository and "\\" not in manifest.source_repository
@@ -457,8 +470,10 @@ def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_re
         "windows_path": r"C:\Users\alice\private\session.log",
         "embedded_windows_path": r"failure at C:\private\secret\session.log",
         "embedded_posix_path": "see /etc/secret/session.log",
+        "file_uri": "source is file:///Users/alice/private/session.log",
     }
     outcome["/Users/alice/private/absolute-key"] = "sensitive value"
+    outcome["file:///Users/alice/private/file-uri-key"] = "sensitive URI key"
     _write_json(outcome_path, outcome)
     feature_path = relay_repo / "feature_list.json"
     features = json.loads(feature_path.read_text(encoding="utf-8"))
@@ -477,6 +492,7 @@ def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_re
     assert "C:\\private\\secret" not in json.dumps(captured)
     assert "/etc/secret" not in json.dumps(captured)
     assert "/Users/alice/private/absolute-key" not in json.dumps(captured)
+    assert "file:///Users/alice/private" not in json.dumps(captured)
     assert manifest.work_items[0]["source_record"]["debug_path"].startswith("<redacted-absolute-path:")
     assert all("/etc/secret" not in commit["message"] for commit in manifest.source_commits)
     assert all("C:\\private\\session.log" not in commit["message"] for commit in manifest.source_commits)

@@ -30,7 +30,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 SCHEMA_VERSION = 1
@@ -65,6 +65,7 @@ COMPLETION_CLAIMS = ("completed", "complete", "done", "passed")
 _RELATION_PREFIX = re.compile(r"^\s*[-*\d.]+\s*")
 _PROGRESS_HEADING = re.compile(r"^\s*(?:#{1,6}\s+)?(session|round|progress|step)\b", re.I)
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_EMBEDDED_FILE_URI = re.compile(r"(?i)\bfile://[^\s\"'<>]+")
 _EMBEDDED_ABSOLUTE_PATH = re.compile(r"(?<![\w:/])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/]|/)[^\s\"'<>]+")
 
 
@@ -117,8 +118,38 @@ def _sanitize_record_paths(value: Any, source: Path) -> tuple[Any, bool]:
                 text = f"<redacted-absolute-path:{candidate.name or 'path'}>"
             else:
                 text = relative.as_posix()
-    scrubbed = _EMBEDDED_ABSOLUTE_PATH.sub("<redacted-absolute-path>", text)
+    scrubbed = _EMBEDDED_FILE_URI.sub("<redacted-absolute-path>", text)
+    scrubbed = _EMBEDDED_ABSOLUTE_PATH.sub("<redacted-absolute-path>", scrubbed)
     return scrubbed, scrubbed != value
+
+
+def _validate_relative_path(value: str, *, label: str) -> str:
+    """Reject non-normalized, absolute, or traversing source-relative paths."""
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise MigrationError(f"{label} must be a normalized relative POSIX path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or not posix.parts
+        or any(part in ("", ".", "..") for part in posix.parts)
+        or posix.as_posix() != value
+    ):
+        raise MigrationError(f"{label} must be a normalized relative POSIX path")
+    return value
+
+
+def _source_path(source: Path, relative: str, *, label: str = "source path") -> Path:
+    relative = _validate_relative_path(relative, label=label)
+    root = Path(source).resolve()
+    path = root / relative
+    try:
+        path.resolve(strict=False).relative_to(root)
+    except (OSError, ValueError) as error:
+        raise MigrationError(f"{label} escapes the Relay source repository") from error
+    return path
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -277,6 +308,14 @@ class RelayMigrationManifest:
             raise MigrationError("manifest records must be JSON arrays")
         if not all(isinstance(item, dict) for records in (work_items, entries, outcomes, commits) for item in records):
             raise MigrationError("manifest records must contain JSON objects")
+        checksums = data.get("checksums") or {}
+        input_files = data.get("input_files", [])
+        if not isinstance(checksums, dict) or not isinstance(input_files, list):
+            raise MigrationError("manifest checksums and input_files have invalid shapes")
+        for relative in checksums:
+            _validate_relative_path(relative, label="manifest checksum path")
+        for relative in input_files:
+            _validate_relative_path(relative, label="manifest input path")
         return cls(
             schema_version=int(version),
             migration_id=str(data["migration_id"]),
@@ -290,11 +329,11 @@ class RelayMigrationManifest:
             session_outcomes=outcomes,
             source_commits=commits,
             provenance={str(k): str(v) for k, v in provenance.items()},
-            checksums={str(k): str(v) for k, v in (data.get("checksums") or {}).items()},
+            checksums={str(k): str(v) for k, v in checksums.items()},
             warnings=[str(item) for item in data.get("warnings") or ()],
             created_at=str(data.get("created_at", "")),
             raw_progress=str(data.get("raw_progress", "")),
-            input_files=[str(x) for x in data.get("input_files", [])],
+            input_files=[str(x) for x in input_files],
             source_status=str(data.get("source_status", "")),
             source_status_digest=str(data.get("source_status_digest", "")),
         )
@@ -478,7 +517,7 @@ def read_source(
     feature_rel = _find_first(source, FEATURE_PATHS)
     if feature_rel is None:
         raise MigrationError("no Relay feature file found; looked for " + ", ".join(str(p) for p in FEATURE_PATHS))
-    feature_path = source / feature_rel
+    feature_path = _source_path(source, feature_rel.as_posix(), label="Relay feature path")
     raw_features = _read_bytes(feature_path)
     checksums[str(feature_rel)] = _sha256(raw_features)
     try:
@@ -497,7 +536,7 @@ def read_source(
         warnings.append("no Relay progress file found; looked for " + ", ".join(str(p) for p in PROGRESS_PATHS))
         entries: list[dict[str, Any]] = []
     else:
-        raw_progress_bytes = _read_bytes(source / progress_rel)
+        raw_progress_bytes = _read_bytes(_source_path(source, progress_rel.as_posix(), label="Relay progress path"))
         checksums[str(progress_rel)] = _sha256(raw_progress_bytes)
         try:
             raw_progress, redacted_paths = _sanitize_record_paths(raw_progress_bytes.decode("utf-8"), source)
@@ -514,7 +553,7 @@ def read_source(
         warnings.append("no Relay project specification found; looked for " + ", ".join(str(p) for p in SPEC_PATHS))
         spec_text = ""
     else:
-        spec_bytes = _read_bytes(source / spec_rel)
+        spec_bytes = _read_bytes(_source_path(source, spec_rel.as_posix(), label="Relay specification path"))
         spec_text, redacted_paths = _sanitize_record_paths(spec_bytes.decode("utf-8", errors="replace"), source)
         checksums[str(spec_rel)] = _sha256(spec_bytes)
         if redacted_paths:
@@ -522,7 +561,7 @@ def read_source(
 
     outcomes: list[dict[str, Any]] = []
     for candidate in OUTCOME_DIRS:
-        directory = source / candidate
+        directory = _source_path(source, candidate.as_posix(), label="Relay outcome directory")
         if not directory.is_dir():
             continue
         kind = "current" if candidate == OUTCOME_DIRS[0] else "legacy"
@@ -533,7 +572,7 @@ def read_source(
             continue
         for record_path in records:
             relative = str(record_path.relative_to(source))
-            raw_outcome = _read_bytes(record_path)
+            raw_outcome = _read_bytes(_source_path(source, relative, label="Relay outcome path"))
             checksums[relative] = _sha256(raw_outcome)
             try:
                 raw_record = json.loads(raw_outcome.decode("utf-8"))
@@ -672,7 +711,7 @@ def build_manifest(
 
 def _read_harness_version(source: Path) -> str:
     for name in ("VERSION", "version.txt"):
-        candidate = source / name
+        candidate = _source_path(source, name, label="Relay version path")
         if candidate.is_file():
             value = candidate.read_text(encoding="utf-8").strip()
             if value:
@@ -701,7 +740,11 @@ def detect_drift(manifest: RelayMigrationManifest, source: Path) -> list[str]:
         if not old_status ^ new_status:
             drift.append("source worktree status changed")
     for relative, expected in sorted(manifest.checksums.items()):
-        path = source / relative
+        try:
+            path = _source_path(source, relative, label="manifest checksum path")
+        except MigrationError:
+            drift.append("manifest contains an invalid source input path")
+            continue
         if not path.is_file():
             drift.append(f"{relative} was removed after the manifest was built")
             continue
