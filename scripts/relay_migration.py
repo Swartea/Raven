@@ -989,12 +989,19 @@ def apply_import(
         entry = _render_journal_section(manifest, plan)
         marker = f"Relay migration {manifest.migration_id}"
         current = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if marker not in current:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as stream:
-                if not current:
-                    stream.write("# Journal\n")
-                stream.write(f"\n## Relay migration {manifest.migration_id}\n\n{entry}\n")
+        section = f"## {marker}\n\n{entry}\n"
+        if section not in current:
+            heading = current.rfind("## " + marker)
+            if heading >= 0:
+                next_heading = current.find("\n## ", heading + len("## " + marker))
+                prefix = current[:heading].rstrip("\n")
+                suffix = current[next_heading + 1 :] if next_heading >= 0 else ""
+                current = prefix + "\n\n" + section + ("\n" + suffix if suffix else "")
+            elif current:
+                current = current.rstrip("\n") + "\n\n" + section
+            else:
+                current = "# Journal\n\n" + section
+            _atomic_write(path, current)
 
     if manifest.project_spec.strip():
         spec_path = target / RECEIPT_DIR / manifest.migration_id / LEGACY_SPEC_FILE

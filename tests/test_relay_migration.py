@@ -487,6 +487,29 @@ def test_interrupted_import_resumes_by_rerun(relay_repo, target_project, monkeyp
 
     monkeypatch.setattr(rm, "_atomic_write", real_write)
     assert not (target_project / rm.RECEIPT_DIR / manifest.migration_id / rm.RECEIPT_FILE).exists()
+
+
+def test_interrupted_journal_section_is_repaired_on_rerun(relay_repo, target_project):
+    manifest = rm.build_manifest(relay_repo)
+    journal = target_project / "JOURNAL.md"
+    journal.write_text(
+        "# Journal\n\n"
+        f"## Relay migration {manifest.migration_id}\n\n"
+        "partial body from interrupted append\n\n"
+        "## Existing later entry\n\nKeep this entry.\n",
+        encoding="utf-8",
+    )
+
+    rm.apply_import(manifest, target_project, apply=True, source=relay_repo)
+    first = journal.read_text(encoding="utf-8")
+    assert "partial body from interrupted append" not in first
+    assert "## Existing later entry\n\nKeep this entry." in first
+    assert first.count(f"## Relay migration {manifest.migration_id}") == 1
+    assert "Imported Relay history" in first
+
+    rm.apply_import(manifest, target_project, apply=True, source=relay_repo)
+    second = journal.read_text(encoding="utf-8")
+    assert second == first
     plan = rm.apply_import(manifest, target_project, apply=True, source=relay_repo)
     assert plan["new_tasks"] == [] and len(plan["skipped_tasks"]) == 6
     tasks = rm._backlog_module().load(target_project).tasks
