@@ -65,7 +65,7 @@ COMPLETION_CLAIMS = ("completed", "complete", "done", "passed")
 _RELATION_PREFIX = re.compile(r"^\s*[-*\d.]+\s*")
 _PROGRESS_HEADING = re.compile(r"^\s*(?:#{1,6}\s+)?(session|round|progress|step)\b", re.I)
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-_EMBEDDED_HOST_PATH = re.compile(r"(?<![\w:])(?:/Users/|/private/|/home/|/tmp/|/var/folders/|/Volumes/)[^\s\"'<>]+")
+_EMBEDDED_ABSOLUTE_PATH = re.compile(r"(?<![\w:/])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/]|/)[^\s\"'<>]+")
 
 
 class MigrationError(RuntimeError):
@@ -116,7 +116,7 @@ def _sanitize_record_paths(value: Any, source: Path) -> tuple[Any, bool]:
                 text = f"<redacted-absolute-path:{candidate.name or 'path'}>"
             else:
                 text = relative.as_posix()
-    scrubbed = _EMBEDDED_HOST_PATH.sub("<redacted-absolute-path>", text)
+    scrubbed = _EMBEDDED_ABSOLUTE_PATH.sub("<redacted-absolute-path>", text)
     return scrubbed, scrubbed != value
 
 
@@ -580,7 +580,7 @@ def build_manifest(
                 sha.strip(),
                 {
                     "sha": sha.strip(),
-                    "message": message.strip(),
+                    "message": _sanitize_record_paths(message.strip(), source)[0],
                     "timestamp": timestamp.strip(),
                     "files": [],
                 },
@@ -689,6 +689,20 @@ def assert_fresh(manifest: RelayMigrationManifest, source: Path) -> None:
     drift = detect_drift(manifest, source)
     if drift:
         raise StaleManifestError("refusing a stale manifest; regenerate it and retry. Changed: " + "; ".join(drift))
+
+
+def validate_manifest_source(manifest: RelayMigrationManifest, source: Path) -> None:
+    """Bind every importable manifest field to a fresh read of its source."""
+    assert_fresh(manifest, source)
+    current = build_manifest(source)
+    captured = manifest.to_dict()
+    rebuilt = current.to_dict()
+    captured.pop("created_at", None)
+    rebuilt.pop("created_at", None)
+    if captured != rebuilt:
+        raise StaleManifestError(
+            "manifest payload or provenance does not match the checksummed Relay source; recapture the manifest"
+        )
 
 
 def _same_repository(source: Path, target: Path) -> bool:
@@ -935,7 +949,7 @@ def apply_import(
         raise MigrationError("applying needs the explicit Relay source repository")
 
     target = Path(target).expanduser().resolve()
-    assert_fresh(manifest, source)
+    validate_manifest_source(manifest, source)
     if _same_repository(source, target):
         raise MigrationError("source and target must be different repositories")
     module = _backlog_module()
@@ -1104,7 +1118,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             manifest = RelayMigrationManifest.load(args.manifest)
             if sanitize_repository_identity(args.source) != manifest.source_repository:
                 raise MigrationError("--source does not match the manifest source repository")
-            assert_fresh(manifest, args.source)
+            validate_manifest_source(manifest, args.source)
         if args.apply:
             if args.target is None:
                 raise MigrationError("--apply needs --target: a dry run writes nothing")
