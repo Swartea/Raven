@@ -1,0 +1,39 @@
+[plugin]
+id           = "agent-orchestrator"
+version      = "0.1.0"
+display_name = "Agent Orchestrator CodeRun"
+raven        = ">=0.1"
+bundled      = false
+
+# Each contribution resolves to one Raven Tool, as required by the plugin
+# registry. All four share the same durable mapping directory across instances.
+[[plugin.contributes.tools]]
+name    = "ao_code_run_submit"
+factory = "raven_ao.tools:make_submit_tool"
+
+[[plugin.contributes.tools]]
+name    = "ao_code_run_status"
+factory = "raven_ao.tools:make_status_tool"
+
+[[plugin.contributes.tools]]
+name    = "ao_code_run_result"
+factory = "raven_ao.tools:make_result_tool"
+
+[[plugin.contributes.tools]]
+name    = "ao_code_run_cancel"
+factory = "raven_ao.tools:make_cancel_tool"
+
+# Type-checked at activation by the host; a bad type fails loudly instead of
+# misbehaving later. No default is declared, so the factory keeps owning its
+# defaults and a valid config behaves exactly as configured.
+#
+# 'executable' is the argv prefix AO is reached through, because AO is a module
+# rather than a standalone binary: ["python3", "-m", "orchestrator.cli"].
+# Set working_dir to the AO checkout so that Python can import its module.
+# Element validation stays with the factory that consumes the value.
+[plugin.config_schema]
+executable  = { type = "array" }
+runs_dir    = { type = "string" }
+working_dir = { type = "string" }
+mapping_dir = { type = "string" }
+timeout     = { type = "number" }
