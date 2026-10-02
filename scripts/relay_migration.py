@@ -835,7 +835,7 @@ def map_work_item(item: dict[str, Any], provenance: dict[str, str]) -> dict[str,
         name=item["feature_id"][:48],
         source=provenance["source_repository"],
         state=state,
-        blocked_by=[UNVERIFIED_BLOCKER] if claimed else [],
+        blocked_by=[UNVERIFIED_BLOCKER] if state == module.BLOCKED else [],
         note="\n".join(note_lines),
     )
     task.history = [

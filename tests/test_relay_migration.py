@@ -354,6 +354,8 @@ def test_status_mapping_never_proves_legacy_work(relay_repo, target_project):
         assert "not proven" in tasks[name].note
     assert tasks["delta"].state == module.BLOCKED and "failed" in tasks["delta"].note
     assert tasks["epsilon"].state == module.BLOCKED
+    assert rm.UNVERIFIED_BLOCKER in tasks["delta"].blocked_by
+    assert rm.UNVERIFIED_BLOCKER in tasks["epsilon"].blocked_by
 
     for task in tasks.values():
         assert task.state != module.DONE
