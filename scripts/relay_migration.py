@@ -455,9 +455,13 @@ def read_source(
     raw_features = _read_bytes(feature_path)
     checksums[str(feature_rel)] = _sha256(raw_features)
     try:
-        work_items = parse_feature_records(json.loads(raw_features.decode("utf-8")), origin=str(feature_rel))
+        feature_data = json.loads(raw_features.decode("utf-8"))
+        feature_data, redacted_paths = _sanitize_record_paths(feature_data, source)
+        work_items = parse_feature_records(feature_data, origin=str(feature_rel))
     except (UnicodeDecodeError, ValueError) as error:
         raise MigrationError(f"Relay features at {feature_rel} are not valid JSON: {error}") from error
+    if redacted_paths:
+        warnings.append(f"absolute host paths were redacted in {feature_rel}")
     if feature_rel == Path("features.json"):
         warnings.append("Relay features were read from the bare features.json fallback path")
 
@@ -469,20 +473,25 @@ def read_source(
         raw_progress_bytes = _read_bytes(source / progress_rel)
         checksums[str(progress_rel)] = _sha256(raw_progress_bytes)
         try:
-            raw_progress = raw_progress_bytes.decode("utf-8")
+            raw_progress, redacted_paths = _sanitize_record_paths(raw_progress_bytes.decode("utf-8"), source)
             entries = parse_progress_text(raw_progress, source_file=str(progress_rel))
         except UnicodeDecodeError as error:
             raise MigrationError(f"Relay progress at {progress_rel} is not UTF-8: {error}") from error
         if progress_rel == Path("claude-progress.txt"):
             warnings.append("Relay progress was read from the legacy claude-progress.txt")
+        if redacted_paths:
+            warnings.append(f"absolute host paths were redacted in {progress_rel}")
 
     spec_rel = _find_first(source, SPEC_PATHS)
     if spec_rel is None:
         warnings.append("no Relay project specification found; looked for " + ", ".join(str(p) for p in SPEC_PATHS))
         spec_text = ""
     else:
-        spec_text = _read_bytes(source / spec_rel).decode("utf-8", errors="replace")
-        checksums[str(spec_rel)] = _sha256(_read_bytes(source / spec_rel))
+        spec_bytes = _read_bytes(source / spec_rel)
+        spec_text, redacted_paths = _sanitize_record_paths(spec_bytes.decode("utf-8", errors="replace"), source)
+        checksums[str(spec_rel)] = _sha256(spec_bytes)
+        if redacted_paths:
+            warnings.append(f"absolute host paths were redacted in {spec_rel}")
 
     outcomes: list[dict[str, Any]] = []
     for candidate in OUTCOME_DIRS:

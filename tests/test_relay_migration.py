@@ -412,12 +412,21 @@ def test_new_outcome_after_capture_is_reported_as_source_drift(relay_repo):
     assert any("sess-new.json" in item for item in rm.detect_drift(manifest, relay_repo))
 
 
-def test_outcome_absolute_paths_are_sanitized_but_source_checksum_is_retained(relay_repo):
+def test_absolute_paths_are_sanitized_but_source_checksums_are_retained(relay_repo):
     outcome_path = relay_repo / ".agent_relay" / "session_outcomes" / "sess-1.json"
     outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
     outcome["prompt_path"] = str(relay_repo / ".agent_relay" / "prompts" / "sess-1.md")
-    outcome["debug"] = {"log_path": "/Users/alice/private/session.log"}
+    outcome["debug"] = {
+        "log_path": "/Users/alice/private/session.log",
+        "windows_path": r"C:\Users\alice\private\session.log",
+    }
     _write_json(outcome_path, outcome)
+    feature_path = relay_repo / "feature_list.json"
+    features = json.loads(feature_path.read_text(encoding="utf-8"))
+    features["features"][0]["debug_path"] = "/Users/alice/private/feature.log"
+    _write_json(feature_path, features)
+    progress_path = relay_repo / "agent-progress.txt"
+    progress_path.write_text(PROGRESS + "Local log: /Users/alice/private/progress.log\n", encoding="utf-8")
     _git(relay_repo, "add", ".")
     _git(relay_repo, "commit", "-q", "-m", "chore: include legacy prompt path")
 
@@ -425,9 +434,12 @@ def test_outcome_absolute_paths_are_sanitized_but_source_checksum_is_retained(re
     captured = manifest.session_outcomes[0]
     assert captured["prompt_path"] == ".agent_relay/prompts/sess-1.md"
     assert captured["source_record"]["debug"]["log_path"].startswith("<redacted-absolute-path:")
+    assert captured["source_record"]["debug"]["windows_path"].startswith("<redacted-absolute-path:")
+    assert manifest.work_items[0]["source_record"]["debug_path"].startswith("<redacted-absolute-path:")
+    assert "/Users/alice/" not in manifest.raw_progress
     assert "/Users/alice/" not in manifest.dump()
     assert outcome_path.relative_to(relay_repo).as_posix() in manifest.checksums
-    assert any("absolute host paths were redacted" in warning for warning in manifest.warnings)
+    assert len([warning for warning in manifest.warnings if "absolute host paths were redacted" in warning]) == 3
 
 
 def test_drifted_manifest_makes_no_target_change(relay_repo, target_project):
