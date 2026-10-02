@@ -730,6 +730,18 @@ class CodeRunAdapter:
         run_id: str | None = None,
         after_seq: int | None = None,
     ) -> dict[str, Any]:
+        mapping = self._resolve(request_id, run_id)
+        # Serialize the complete read/fetch/advance operation across adapter
+        # instances and processes. Advancing the cursor alone is not enough:
+        # without this lock, a losing reader could still return the page it
+        # fetched before another reader advanced the durable cursor.
+        async with self._control_lock(mapping.request_id):
+            mapping = self._store.get(mapping.request_id) or mapping
+            return await self._events_locked(mapping, after_seq)
+
+    async def _events_locked(
+        self, mapping: RunMapping, after_seq: int | None
+    ) -> dict[str, Any]:
         """Consume one incremental page of AO's durable event log.
 
         The cursor is the contract. ``after_seq`` defaults to the mapping's
@@ -750,7 +762,6 @@ class CodeRunAdapter:
         the response reports events as a projection; acceptance and terminal
         state still come from AO's formal status and result.
         """
-        mapping = self._resolve(request_id, run_id)
         cursor = mapping.last_seen_event_seq
         requested = cursor if after_seq is None else after_seq
         if (
@@ -773,10 +784,7 @@ class CodeRunAdapter:
             )
 
         try:
-            payload = _formal(
-                await self._client.events(mapping.request_id, requested),
-                "code-run-events",
-            )
+            event_call = await self._client.events(mapping.request_id, requested)
         except (CliInvocationError, MalformedResponseError) as exc:
             # An infrastructure failure leaves the cursor exactly where it was,
             # so the same range is retried rather than lost. AO not knowing the
@@ -791,6 +799,44 @@ class CodeRunAdapter:
                         "This is an invocation failure, not a verdict about the run."
                     ),
                 }
+            return {
+                **_events_payload(mapping, requested, [], cursor),
+                "ok": False,
+                "outcome": "malformed_response",
+                "error": str(exc),
+                "detail": (
+                    "The AO event page was not readable, so no cursor was "
+                    "advanced and the same range is read again next time."
+                ),
+            }
+
+        if _is_missing_request(event_call):
+            stale = self._mark_stale(mapping, "code-run-events")
+            return {
+                **_events_payload(mapping, requested, [], cursor),
+                **stale,
+                "after_seq": requested,
+                "events": [],
+                "previous_cursor": cursor,
+                "last_seen_event_seq": cursor,
+                "cursor_advanced": False,
+                "event_count": 0,
+                "event_types": [],
+            }
+
+        try:
+            payload = _formal(event_call, "code-run-events")
+        except CliInvocationError as exc:
+            return {
+                **_events_payload(mapping, requested, [], cursor),
+                **_cli_failure(mapping, "code-run-events", exc),
+                "detail": (
+                    "The AO event page could not be read, so no cursor was "
+                    "advanced and the same range is read again next time. "
+                    "This is an invocation failure, not a verdict about the run."
+                ),
+            }
+        except MalformedResponseError as exc:
             return {
                 **_events_payload(mapping, requested, [], cursor),
                 "ok": False,
@@ -860,6 +906,14 @@ class CodeRunAdapter:
         except MalformedResponseError as exc:
             return _cli_failure(mapping, "code-run-status", exc)
         if _is_interrupted(parsed):
+            if parsed.get("request_id") != mapping.request_id:
+                return _cli_failure(
+                    mapping,
+                    "code-run-status",
+                    MalformedResponseError(
+                        "status answered for a different request_id"
+                    ),
+                )
             # Observable and recoverable, not terminal: the slot stays held and
             # no acceptance is inferred from the interruption.
             return _interrupted_response(mapping, parsed, "code-run-status")
@@ -1056,6 +1110,14 @@ class CodeRunAdapter:
         except MalformedResponseError as exc:
             return _cli_failure(mapping, "code-run-cancel", exc)
         if _is_interrupted(parsed):
+            if parsed.get("request_id") != mapping.request_id:
+                return _cli_failure(
+                    mapping,
+                    "code-run-cancel",
+                    MalformedResponseError(
+                        "cancel answered for a different request_id"
+                    ),
+                )
             return _interrupted_response(mapping, parsed, "code-run-cancel")
         try:
             payload = parsed

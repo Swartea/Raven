@@ -757,6 +757,36 @@ async def test_events_resume_from_cursor_and_survive_a_restart(tmp_path: Path) -
     assert client.event_reads[-1] == (request_id, 3)
 
 
+async def test_concurrent_event_reads_return_distinct_pages(tmp_path: Path) -> None:
+    client = FakeClient()
+    adapter = make_adapter(tmp_path, client)
+    request_id = (await submit_once(adapter))["request_id"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_events(request: str, after_seq: int = -1) -> CliResult:
+        client.event_reads.append((request, after_seq))
+        if after_seq == -1:
+            entered.set()
+            await release.wait()
+            page = event_page(request, [event(0)])
+        else:
+            page = event_page(request, [event(after_seq + 1)])
+        return CliResult(0, json.dumps(page), "")
+
+    client.events = delayed_events  # type: ignore[method-assign]
+    first_task = asyncio.create_task(adapter.events(request_id=request_id))
+    await entered.wait()
+    second_task = asyncio.create_task(adapter.events(request_id=request_id))
+    await asyncio.sleep(0.03)
+    release.set()
+
+    first, second = await asyncio.gather(first_task, second_task)
+    assert [item["sequence"] for item in first["events"]] == [0]
+    assert [item["sequence"] for item in second["events"]] == [1]
+    assert client.event_reads == [(request_id, -1), (request_id, 0)]
+
+
 async def test_events_persist_the_cursor_with_the_rest_of_the_mapping(tmp_path: Path) -> None:
     client = FakeClient()
     adapter = make_adapter(tmp_path, client)
@@ -930,6 +960,30 @@ async def test_interrupted_stays_its_own_recoverable_state(tmp_path: Path) -> No
     assert adapter.capacity.holds(request_id) is True
 
 
+@pytest.mark.parametrize("operation", ["status", "cancel"])
+async def test_interrupted_response_for_another_request_is_rejected(
+    tmp_path: Path, operation: str
+) -> None:
+    client = FakeClient()
+    adapter = make_adapter(tmp_path, client)
+    request_id = (await submit_once(adapter))["request_id"]
+    interrupted = {
+        "request_id": "some-other-request",
+        "execution_state": "interrupted",
+        "change_acceptance": "not_evaluated",
+    }
+    if operation == "status":
+        client.status_response = interrupted
+        out = await adapter.status(request_id=request_id)
+    else:
+        client.cancel_response = interrupted
+        out = await adapter.cancel(request_id=request_id)
+
+    assert out["ok"] is False and out["outcome"] == "malformed_response"
+    assert "different request_id" in out["error"]
+    assert adapter.capacity.holds(request_id) is True
+
+
 async def test_pending_cancel_keeps_its_slot_and_stays_nonterminal(tmp_path: Path) -> None:
     client = FakeClient()
     adapter = make_adapter(tmp_path, client)
@@ -991,6 +1045,41 @@ async def test_events_cli_invocation_failure_keeps_the_cursor(tmp_path: Path) ->
     assert failed["events"] == []
     stored = MappingStore(tmp_path / "mapping").get(request_id)
     assert stored is not None and stored.last_seen_event_seq == 7
+
+
+async def test_events_missing_request_marks_mapping_stale_and_releases_capacity(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    adapter = make_adapter(tmp_path, client)
+    request_id = (await submit_once(adapter))["request_id"]
+    client.event_exit = 2
+
+    out = await adapter.events(request_id=request_id)
+
+    assert out["ok"] is False and out["outcome"] == "stale_mapping"
+    assert out["events"] == [] and out["cursor_advanced"] is False
+    stored = MappingStore(tmp_path / "mapping").get(request_id)
+    assert stored is not None and stored.state == "stale_mapping"
+    assert adapter.capacity.holds(request_id) is False
+
+
+async def test_events_nonzero_cli_failure_keeps_mapping_and_cursor(tmp_path: Path) -> None:
+    client = FakeClient()
+    adapter = make_adapter(tmp_path, client)
+    request_id = (await submit_once(adapter))["request_id"]
+
+    async def failed_events(request: str, after_seq: int = -1) -> CliResult:
+        return CliResult(2, "", "temporary AO CLI failure")
+
+    client.events = failed_events  # type: ignore[method-assign]
+    out = await adapter.events(request_id=request_id)
+
+    assert out["ok"] is False and out["outcome"] == "cli_failed"
+    assert out["events"] == [] and out["previous_cursor"] == -1
+    stored = MappingStore(tmp_path / "mapping").get(request_id)
+    assert stored is not None and stored.state != "stale_mapping"
+    assert adapter.capacity.holds(request_id) is True
 
 
 def test_events_client_builds_the_after_seq_argv(tmp_path: Path) -> None:
