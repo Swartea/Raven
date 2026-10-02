@@ -321,6 +321,8 @@ def _find_first(source: Path, candidates: Sequence[Path]) -> Path | None:
 
 def _normalise_status(value: Any) -> str:
     status = str(value or "").strip().lower()
+    if status in COMPLETION_CLAIMS:
+        return "completed"
     return status if status in RELAY_STATUSES else "pending"
 
 
@@ -360,7 +362,8 @@ def parse_feature_records(data: Any, *, origin: str) -> list[dict[str, Any]]:
         if not feature_id:
             raise MigrationError(f"Relay feature #{ordinal} at {origin} has no id")
         title = str(record.get("title") or record.get("name") or feature_id).strip()
-        status = _normalise_status(record.get("status"))
+        source_status = str(record.get("status") or "pending").strip()
+        status = _normalise_status(source_status)
         passes = _opt_bool(record.get("passes")) is True
         steps = _as_list(record.get("steps") or record.get("acceptance_criteria"))
         items.append(
@@ -368,7 +371,8 @@ def parse_feature_records(data: Any, *, origin: str) -> list[dict[str, Any]]:
                 "feature_id": feature_id,
                 "title": title,
                 "relay_status": status,
-                "claimed_complete": passes or status in COMPLETION_CLAIMS,
+                "source_status": source_status,
+                "claimed_complete": passes or status == "completed",
                 "passes_claim": passes,
                 "steps": steps,
                 "notes": str(record.get("notes") or "").strip(),
@@ -768,15 +772,15 @@ def map_work_item(item: dict[str, Any], provenance: dict[str, str]) -> dict[str,
     reasons: list[str] = []
     if item["passes_claim"]:
         reasons.append("Relay claimed passes=true")
-    if item["relay_status"] in COMPLETION_CLAIMS and not item["passes_claim"]:
-        reasons.append(f"Relay status was {item['relay_status']}")
+    if item["relay_status"] == "completed" and not item["passes_claim"]:
+        reasons.append(f"Relay status was {item['source_status']}")
     if failed:
         reasons.append("Relay status was failed")
     if item["relay_status"] == "blocked":
         reasons.append("Relay status was blocked")
 
     note_lines = [
-        f"Relay feature {item['feature_id']}: source status {item['relay_status']}.",
+        f"Relay feature {item['feature_id']}: source status {item['source_status']}.",
         f"Provenance: {_provenance_line(provenance)}.",
         f"Relay source file: {item['source_file'] or 'unknown'}.",
         "Imported as a legacy claim only: not proven, not verified, not accepted.",
@@ -915,6 +919,7 @@ def _render_receipt(manifest: RelayMigrationManifest, plan: dict[str, Any]) -> d
             {
                 "feature_id": item["feature_id"],
                 "relay_status": item["relay_status"],
+                "source_status": item["source_status"],
                 "imported_state": map_work_item(item, manifest.provenance)["state"],
                 "marker": _marker(manifest.provenance, "feature", item["feature_id"]),
                 "source_file": item["source_file"],

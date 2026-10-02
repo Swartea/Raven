@@ -157,6 +157,28 @@ def test_passes_outranks_completed_and_rejects_malformed():
         rm.parse_feature_records(["not-a-record"], origin="f.json")
 
 
+@pytest.mark.parametrize("legacy_status", ["completed", "complete", "done", "passed"])
+def test_completion_status_aliases_remain_review_blocked_claims(legacy_status):
+    item = rm.parse_feature_records([{"id": "legacy", "status": legacy_status}], origin="feature_list.json")[0]
+    planned = rm.map_work_item(
+        item,
+        {
+            "source_kind": rm.EVIDENCE_KIND,
+            "source_repository": "relay-source",
+            "source_head": "a" * 40,
+            "migration_id": "relay-migration-test",
+        },
+    )
+    module = rm._backlog_module()
+
+    assert item["claimed_complete"] is True
+    assert item["relay_status"] == "completed"
+    assert item["source_status"] == legacy_status
+    assert planned["state"] == module.BLOCKED
+    assert rm.UNVERIFIED_BLOCKER in planned["task"].blocked_by
+    assert f"source status {legacy_status}" in planned["task"].note
+
+
 def test_progress_keeps_order_and_raw_text():
     entries = rm.parse_progress_text(PROGRESS)
     assert [entry["index"] for entry in entries] == list(range(len(entries)))
