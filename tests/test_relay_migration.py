@@ -243,6 +243,12 @@ def test_manifest_rejects_absolute_and_traversing_checksum_paths(relay_repo, tmp
             rm.RelayMigrationManifest.from_dict(payload)
 
 
+def test_apply_dry_run_rejects_source_as_target(relay_repo):
+    manifest = rm.build_manifest(relay_repo)
+    with pytest.raises(rm.MigrationError, match="source and target must be different"):
+        rm.apply_import(manifest, relay_repo, apply=False, source=relay_repo)
+
+
 def test_source_identity_is_not_a_host_path(relay_repo):
     manifest = rm.build_manifest(relay_repo)
     assert "/" not in manifest.source_repository and "\\" not in manifest.source_repository
@@ -528,6 +534,28 @@ def test_git_status_paths_are_redacted_but_drift_still_detects_changes(relay_rep
     drift = rm.detect_drift(manifest, relay_repo)
     assert any("worktree" in item for item in drift)
     assert all("alice" not in item for item in drift)
+
+
+def test_status_drift_diagnostics_redact_tampered_manifest_paths(relay_repo):
+    payload = rm.build_manifest(relay_repo).to_dict()
+    payload["source_status"] = "?? /Users/alice/private/source-file"
+    payload["source_status_digest"] = "0" * 64
+    manifest = rm.RelayMigrationManifest.from_dict(payload)
+
+    drift = rm.detect_drift(manifest, relay_repo)
+
+    assert any("worktree changed" in item for item in drift)
+    assert all("/Users/alice" not in item for item in drift)
+
+
+def test_capture_manifest_output_cannot_mutate_relay_source(relay_repo):
+    before = _tree_snapshot(relay_repo)
+    manifest_path = relay_repo / "captured-manifest.json"
+
+    assert rm.main(["capture", "--source", str(relay_repo), "--manifest-out", str(manifest_path)]) == 2
+
+    assert not manifest_path.exists()
+    assert _tree_snapshot(relay_repo) == before
 
 
 def test_edited_manifest_payload_is_rejected_before_import(relay_repo, target_project):

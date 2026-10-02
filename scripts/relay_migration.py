@@ -152,6 +152,14 @@ def _source_path(source: Path, relative: str, *, label: str = "source path") -> 
     return path
 
 
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        Path(path).expanduser().resolve().relative_to(Path(directory).expanduser().resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Replace a file in one step so an interrupted import never truncates it.
 
@@ -730,9 +738,10 @@ def detect_drift(manifest: RelayMigrationManifest, source: Path) -> list[str]:
         drift.append(f"source HEAD moved from {manifest.source_head[:12]} to {(head or 'none')[:12]}")
     current_raw_status = _git(source, "status", "--porcelain") or ""
     current_status, _ = _sanitize_git_status(current_raw_status, source)
+    manifest_status, _ = _sanitize_git_status(manifest.source_status, source)
     current_status_digest = _sha256(current_raw_status.encode("utf-8"))
     if manifest.source_status_digest != current_status_digest:
-        old_status = set(manifest.source_status.splitlines())
+        old_status = set(manifest_status.splitlines())
         new_status = set(current_status.splitlines())
         for line in sorted(old_status ^ new_status):
             relative = line[3:].strip() if len(line) > 3 else line.strip()
@@ -1022,7 +1031,7 @@ def apply_import(
     needing a transaction.
     """
     if not apply:
-        return plan_import(manifest, target)
+        return plan_import(manifest, target, source=source)
     if target is None:
         raise MigrationError("applying needs an explicit target project")
     if source is None:
@@ -1198,7 +1207,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "capture":
             manifest = build_manifest(args.source)
             if args.manifest_out:
-                _atomic_write(Path(args.manifest_out), manifest.dump())
+                repository_root = Path(_git(args.source, "rev-parse", "--show-toplevel") or args.source).resolve()
+                manifest_out = Path(args.manifest_out).expanduser()
+                if _is_within(manifest_out, repository_root):
+                    raise MigrationError("--manifest-out must be outside the read-only Relay source repository")
+                _atomic_write(manifest_out, manifest.dump())
         else:
             if args.manifest is None:
                 raise MigrationError("import needs --manifest captured by a prior run")
