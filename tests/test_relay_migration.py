@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -146,6 +147,14 @@ def test_parses_legacy_field_spellings():
     assert items[0]["steps"] == ["one", "two"]
     assert items[1]["steps"] == ["x"]
     assert items[2]["relay_status"] == "pending" and items[3]["relay_status"] == "pending"
+
+
+def test_duplicate_feature_ids_are_rejected():
+    with pytest.raises(rm.MigrationError, match="IDs must be unique"):
+        rm.parse_feature_records(
+            [{"id": "duplicate"}, {"id": " duplicate ", "status": "completed"}],
+            origin="feature_list.json",
+        )
 
 
 def test_passes_outranks_completed_and_rejects_malformed():
@@ -485,6 +494,22 @@ def test_path_diagnostics_do_not_echo_host_paths(tmp_path):
     with pytest.raises(rm.MigrationError) as manifest_error:
         rm.RelayMigrationManifest.load(missing_manifest)
     assert str(missing_manifest) not in str(manifest_error.value)
+
+
+def test_git_status_paths_are_redacted_but_drift_still_detects_changes(relay_repo):
+    if os.name != "posix":
+        pytest.skip("POSIX permits Windows-shaped filenames")
+    first_path = relay_repo / r"C:\Users\alice\private.log"
+    first_path.write_text("first", encoding="utf-8")
+    manifest = rm.build_manifest(relay_repo)
+    assert "C:\\\\Users\\\\alice" not in manifest.dump()
+    assert manifest.source_dirty is True
+    assert manifest.source_status_digest
+
+    first_path.rename(relay_repo / r"C:\Users\alice\renamed.log")
+    drift = rm.detect_drift(manifest, relay_repo)
+    assert any("worktree" in item for item in drift)
+    assert all("alice" not in item for item in drift)
 
 
 def test_edited_manifest_payload_is_rejected_before_import(relay_repo, target_project):

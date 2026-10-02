@@ -224,6 +224,7 @@ class RelayMigrationManifest:
     raw_progress: str = ""
     input_files: list[str] = field(default_factory=list)
     source_status: str = ""
+    source_status_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -234,6 +235,7 @@ class RelayMigrationManifest:
             "raw_progress": self.raw_progress,
             "input_files": self.input_files,
             "source_status": self.source_status,
+            "source_status_digest": self.source_status_digest,
             "source": {
                 "repository": self.source_repository,
                 "head": self.source_head,
@@ -294,6 +296,7 @@ class RelayMigrationManifest:
             raw_progress=str(data.get("raw_progress", "")),
             input_files=[str(x) for x in data.get("input_files", [])],
             source_status=str(data.get("source_status", "")),
+            source_status_digest=str(data.get("source_status_digest", "")),
         )
 
     @classmethod
@@ -328,6 +331,20 @@ def _normalise_status(value: Any) -> str:
     return status if status in RELAY_STATUSES else "pending"
 
 
+def _sanitize_git_status(status: str, source: Path) -> tuple[str, bool]:
+    """Redact path-shaped filenames while retaining status codes and line order."""
+    sanitized_lines: list[str] = []
+    changed = False
+    for line in status.splitlines():
+        if len(line) <= 3:
+            sanitized_lines.append(line)
+            continue
+        path, path_changed = _sanitize_record_paths(line[3:], source)
+        sanitized_lines.append(line[:3] + path)
+        changed |= path_changed
+    return "\n".join(sanitized_lines), changed
+
+
 def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -357,12 +374,16 @@ def parse_feature_records(data: Any, *, origin: str) -> list[dict[str, Any]]:
         raise MigrationError(f"Relay features at {origin} are not a list of records")
 
     items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for ordinal, record in enumerate(data):
         if not isinstance(record, dict):
             raise MigrationError(f"Relay feature #{ordinal} at {origin} is not an object")
         feature_id = str(record.get("id") or record.get("feature_id") or "").strip()
         if not feature_id:
             raise MigrationError(f"Relay feature #{ordinal} at {origin} has no id")
+        if feature_id in seen_ids:
+            raise MigrationError(f"Relay feature IDs must be unique; duplicate at record #{ordinal} in {origin}")
+        seen_ids.add(feature_id)
         title = str(record.get("title") or record.get("name") or feature_id).strip()
         source_status = str(record.get("status") or "pending").strip()
         status = _normalise_status(source_status)
@@ -558,10 +579,14 @@ def build_manifest(
     head = _git(source, "rev-parse", "HEAD") or ""
     if not head:
         raise MigrationError("Relay source must be a Git repository with a resolvable HEAD")
-    source_status = _git(source, "status", "--porcelain") or ""
-    dirty = bool(source_status)
+    raw_source_status = _git(source, "status", "--porcelain") or ""
+    source_status, source_status_redacted = _sanitize_git_status(raw_source_status, source)
+    source_status_digest = _sha256(raw_source_status.encode("utf-8"))
+    dirty = bool(raw_source_status)
     if dirty:
         warnings.append("Relay source worktree is dirty; the manifest describes HEAD plus local changes")
+    if source_status_redacted:
+        warnings.append("absolute host paths were redacted from the Relay worktree status")
 
     version = harness_version or _read_harness_version(source)
     if version == "unknown":
@@ -641,6 +666,7 @@ def build_manifest(
         raw_progress=raw_progress,
         input_files=sorted(checksums),
         source_status=source_status,
+        source_status_digest=source_status_digest,
     )
 
 
@@ -663,13 +689,17 @@ def detect_drift(manifest: RelayMigrationManifest, source: Path) -> list[str]:
     head = _git(source, "rev-parse", "HEAD") or ""
     if manifest.source_head and head != manifest.source_head:
         drift.append(f"source HEAD moved from {manifest.source_head[:12]} to {(head or 'none')[:12]}")
-    current_status = _git(source, "status", "--porcelain") or ""
-    if manifest.source_status != current_status:
+    current_raw_status = _git(source, "status", "--porcelain") or ""
+    current_status, _ = _sanitize_git_status(current_raw_status, source)
+    current_status_digest = _sha256(current_raw_status.encode("utf-8"))
+    if manifest.source_status_digest != current_status_digest:
         old_status = set(manifest.source_status.splitlines())
         new_status = set(current_status.splitlines())
         for line in sorted(old_status ^ new_status):
             relative = line[3:].strip() if len(line) > 3 else line.strip()
             drift.append(f"source worktree changed at {relative}")
+        if not old_status ^ new_status:
+            drift.append("source worktree status changed")
     for relative, expected in sorted(manifest.checksums.items()):
         path = source / relative
         if not path.is_file():
