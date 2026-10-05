@@ -1,6 +1,8 @@
-"""The spine Scheduler's submit surface: outcomes, loop affinity, and conversation ids."""
+"""The spine Scheduler's submit surface: outcomes, loop affinity, conversation
+ids, and settlement under cancellation races."""
 
 import asyncio
+import contextlib
 
 import pytest
 from loguru import logger
@@ -12,12 +14,13 @@ from raven.spine import (
     OriginPools,
     Scheduler,
     Source,
+    TurnEnded,
     TurnFailed,
     TurnOutcome,
     TurnRequest,
     Usage,
 )
-from raven.spine.scheduler import _DEFAULT_IDLE_TTL, SchedulerDrainingError
+from raven.spine.scheduler import _DEFAULT_IDLE_TTL, SchedulerDrainingError, _settle
 
 
 def _req(
@@ -28,9 +31,12 @@ def _req(
     origin=Origin.USER,
     busy=BusyPolicy.APPEND,
     text="hi",
+    turn_id=None,
 ) -> TurnRequest:
     src = Source(channel=channel, chat_id=chat_id, sender_id="u", chat_type=ChatType.DM)
-    return TurnRequest(origin=origin, source=src, text=text, conversation=conversation, busy=busy)
+    return TurnRequest(
+        origin=origin, source=src, text=text, conversation=conversation, busy=busy, turn_id=turn_id
+    )
 
 
 async def _sink(event) -> None:
@@ -719,3 +725,355 @@ def test_the_turn_entry_guard_bites(tmp_path):
     )
     strays = _turn_entry_strays(pkg)
     assert len(strays) == 2, strays
+
+
+# --- settlement under cancellation races -------------------------------------
+#
+# A consumer that awaited TurnHandle.result() inside a task and was itself
+# cancelled -- a CLI interrupt, an aborted gateway request, a caller that gave up
+# -- cancels the future it was awaiting. The lane's own resolver then meets a dead
+# future, and every path below used to call set_result on it. These pin the
+# invariants that cost: the entry leaves the queue, the turn's end is still named
+# exactly once, the lane worker survives to run the next turn, and nothing raises.
+
+
+_SETTLE_TIMEOUT = 1.0
+
+
+def _recorder() -> tuple[list, object]:
+    events: list = []
+
+    async def sink(event) -> None:
+        events.append(event)
+
+    return events, sink
+
+
+def _terminal(events: list, turn_id: str) -> list:
+    """A turn's own terminal events. Exactly one is the contract: a consumer
+    releases the ending turn's slots on the first, and a second is exactly what
+    per-turn idempotent release exists to absorb."""
+    return [e for e in events if isinstance(e, (TurnEnded, TurnFailed)) and e.turn_id == turn_id]
+
+
+def _names(events: list) -> list[str]:
+    return [type(e).__name__ for e in events]
+
+
+async def _settled(handle) -> object:
+    """Wait for a turn's future to be terminal without letting a cancelled
+    waiter's CancelledError escape into the test. Bounded, so a regression that
+    never settles fails here instead of hanging the suite."""
+    fut = handle._fut
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SETTLE_TIMEOUT
+    while not fut.done():
+        if loop.time() > deadline:
+            pytest.fail("turn future never settled")
+        await asyncio.sleep(0.001)
+    return None if fut.cancelled() else fut.result()
+
+
+async def _wait_task_done(task) -> None:
+    """Bounded wait for a task to finish. Polling rather than awaiting it, so a
+    regression that strands the task reports 'worker never terminated' instead of
+    having the wait itself cancel the evidence."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SETTLE_TIMEOUT
+    while not task.done():
+        if loop.time() > deadline:
+            pytest.fail("lane worker never terminated")
+        await asyncio.sleep(0.001)
+
+
+def _worker_error(lane) -> BaseException | None:
+    """What the lane worker died of, if it is already finished. The sentinel for
+    every test in this section: an InvalidStateError escaping a settlement path
+    lands here, and on a still-running worker it is an unretrieved task exception
+    that pytest would report without saying where."""
+    task = lane._worker
+    if task is None or not task.done() or task.cancelled():
+        return None
+    return task.exception()
+
+
+def _assert_released(lane) -> None:
+    assert lane._run_task is None and lane._running_fut is None  # the in-flight slot is free
+
+
+async def test_queued_future_cancelled_before_drain_leaves_the_queue_clean():
+    gate = asyncio.Event()
+    runner = NonDrainingRunner(gate)  # completes once the gate opens
+    events, sink = _recorder()
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    host = sched.submit(_req(channel="tg", chat_id="1", text="host", turn_id="host"))
+    await runner.started.wait()
+    queued = sched.submit(_req(channel="tg", chat_id="1", text="queued", turn_id="queued"))
+    lane = sched._lanes["tg:1"]
+
+    queued._fut.cancel()  # its submitter's task went away while the turn sat queued
+    assert queued._fut.cancelled()
+    assert len(lane._pending) == 1  # nothing has released the entry yet
+
+    assert lane.drain_pending() == 1  # /stop's queue drain
+    assert not lane._pending  # the entry is gone, not left to run behind the host
+    assert queued._fut.cancelled()  # settled once: cancelled, never re-resolved
+
+    gate.set()
+    assert isinstance(await _settled(host), TurnOutcome)  # the running turn is untouched
+    assert _names(_terminal(events, "host")) == ["TurnEnded"]
+    assert _terminal(events, "queued") == []  # a drained turn never ran; drain is silent by design
+    later = sched.submit(_req(channel="tg", chat_id="1", text="later", turn_id="later"))
+    assert isinstance(await _settled(later), TurnOutcome)  # the lane is still usable
+    assert runner.ran == ["host", "later"]  # the cancelled queued turn never ran
+    _assert_released(lane)
+    assert _worker_error(lane) is None
+
+
+async def test_running_future_cancelled_while_the_worker_completes():
+    gate = asyncio.Event()
+    runner = NonDrainingRunner(gate)
+    events, sink = _recorder()
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    first = sched.submit(_req(channel="tg", chat_id="1", text="first", turn_id="first"))
+    await runner.started.wait()
+    lane = sched._lanes["tg:1"]
+    second = sched.submit(_req(channel="tg", chat_id="1", text="second", turn_id="second"))  # queued behind
+
+    first._fut.cancel()  # the submitter's task went away mid-turn
+    gate.set()  # the worker completes the turn and resolves a dead future
+    # Without the guard the set_result in the worker's finally raises
+    # InvalidStateError out of that finally, killing the worker mid-drain: the
+    # mailbox fallback below it never runs and second never starts, so this
+    # wait_for is the bounded failure.
+    assert isinstance(await _settled(second), TurnOutcome)
+    assert first._fut.cancelled()  # settled once: the dead future was not revived
+    assert _names(_terminal(events, "first")) == ["TurnEnded"]  # the end is still named
+    assert _names(_terminal(events, "second")) == ["TurnEnded"]
+    assert runner.ran == ["first", "second"]
+    _assert_released(lane)
+    assert _worker_error(lane) is None
+
+
+async def test_handle_cancel_survives_its_own_future_being_cancelled_mid_call():
+    # The race inside cancel_turn: its queued branch awaits the sink before it
+    # resolves, and the caller's future can be cancelled across that await.
+    parked, release = asyncio.Event(), asyncio.Event()
+    events: list = []
+
+    async def sink(event) -> None:
+        events.append(event)
+        if isinstance(event, TurnFailed):
+            parked.set()
+            await release.wait()  # park inside cancel_turn's terminal emit
+
+    gate = asyncio.Event()
+    runner = NonDrainingRunner(gate)
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    host = sched.submit(_req(channel="tg", chat_id="1", text="host", turn_id="host"))
+    await runner.started.wait()
+    queued = sched.submit(_req(channel="tg", chat_id="1", text="queued", turn_id="queued"))
+    lane = sched._lanes["tg:1"]
+
+    cancelling = asyncio.create_task(queued.cancel())
+    await asyncio.wait_for(parked.wait(), timeout=_SETTLE_TIMEOUT)  # parked inside the sink await
+    queued._fut.cancel()  # the submitter's task goes away across that await
+    release.set()
+    await asyncio.wait_for(cancelling, timeout=_SETTLE_TIMEOUT)  # returned instead of raising
+    assert queued._fut.cancelled()  # settled once: cancelled, not re-resolved
+    assert not lane._pending  # the entry was removed before the emit, as it always was
+    assert _names(_terminal(events, "queued")) == ["TurnFailed"]  # named exactly once
+    assert not host._fut.done()  # surgical: the running turn is left alone
+
+    gate.set()
+    assert isinstance(await _settled(host), TurnOutcome)
+    assert _names(_terminal(events, "host")) == ["TurnEnded"]
+    later = sched.submit(_req(channel="tg", chat_id="1", text="later", turn_id="later"))
+    assert isinstance(await _settled(later), TurnOutcome)  # the lane is still usable
+    assert runner.ran == ["host", "later"]
+    _assert_released(lane)
+    assert _worker_error(lane) is None
+
+
+async def test_shutdown_after_an_interrupted_waiter_still_files_the_turns_end():
+    # The CLI interrupt, end to end: the submitter's task is cancelled while
+    # parked on the handle, so the future goes with it, and shutdown then has to
+    # cascade-cancel a turn whose future is already dead. The turn's end is still
+    # owed to its consumer -- the turn had not reported when the waiter left.
+    runner = HangingRunner()
+    events, sink = _recorder()
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    host = sched.submit(_req(channel="tg", chat_id="1", text="host", turn_id="host"))
+    await runner.started.wait()
+    lane = sched._lanes["tg:1"]
+    worker = lane._worker
+
+    waiter = asyncio.create_task(host.result())  # the submitter is parked on the handle
+    await asyncio.sleep(0.001)  # let it reach the await
+    waiter.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await waiter
+    assert host._fut.cancelled()  # the interrupt reached the future the lane resolves
+
+    await asyncio.wait_for(sched.shutdown(grace=0.01), timeout=2 * _SETTLE_TIMEOUT)  # outlasts grace
+    await _wait_task_done(worker)
+    # The regression the previous candidate shipped as green: without the
+    # cascade-cancel actually reaching the payload, this list is empty and the
+    # turn ends with nothing named -- a consumer holding its slots forever.
+    assert _names(_terminal(events, "host")) == ["TurnFailed"]
+    assert host._fut.cancelled()  # settled once, not revived by the cascade
+    assert worker.cancelled() is False
+    assert worker.exception() is None  # no InvalidStateError out of the worker's finally
+    with pytest.raises(SchedulerDrainingError):
+        sched.submit(_req(channel="tg", chat_id="2"))  # shutdown seals the lane for good
+
+
+async def test_completion_and_cancel_racing_resolve_a_turn_exactly_once():
+    # Both winners, twelve rounds: on the even rounds the caller cancels in the
+    # window the guard exists for -- the turn has filed its TurnEnded and the
+    # lane has not resolved the handle yet -- and on the odd rounds the
+    # completion wins and the later cancel is a no-op.
+    rounds = 12
+    for round_no in range(rounds):
+        events: list = []
+        holder: dict = {}
+
+        async def sink(event, _events=events, _holder=holder, _cancel_wins=round_no % 2 == 0) -> None:
+            _events.append(event)
+            if _cancel_wins and isinstance(event, TurnEnded):
+                _holder["handle"]._fut.cancel()
+
+        sched = Scheduler(SuccessRunner(), OriginPools(user=1, system=1), sink)
+        handle = sched.submit(_req(channel="tg", chat_id="1", text="t", turn_id=f"t{round_no}"))
+        holder["handle"] = handle
+        lane = sched._lanes["tg:1"]
+        worker = lane._worker
+
+        await _settled(handle)
+        if round_no % 2 == 0:
+            assert handle._fut.cancelled()  # the caller won the race
+        else:
+            assert handle._fut.cancel() is False  # completion won: the cancel is a no-op
+        await _wait_task_done(worker)
+        assert worker.cancelled() is False
+        assert worker.exception() is None  # neither order raised out of the settlement
+        assert _names(_terminal(events, f"t{round_no}")) == ["TurnEnded"]  # named exactly once
+        _assert_released(lane)
+        assert _worker_error(lane) is None
+
+
+async def test_cancelled_mailbox_inject_drains_clean_and_leaves_the_host_running():
+    gate = asyncio.Event()
+    runner = NonDrainingRunner(gate)  # never drains, so the inject stays mailboxed
+    events, sink = _recorder()
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    host = sched.submit(_req(channel="tg", chat_id="1", text="host", turn_id="host"))
+    await runner.started.wait()
+    inject = sched.submit(_req(channel="tg", chat_id="1", busy=BusyPolicy.INJECT, text="inject", turn_id="inject"))
+    lane = sched._lanes["tg:1"]
+    assert len(lane._inject_mailbox) == 1
+
+    inject._fut.cancel()  # its submitter's task went away while it sat in the mailbox
+    assert inject._fut.cancelled()
+
+    assert lane.drain_pending() == 1  # /stop's drain, with the entry already dead
+    assert not lane._inject_mailbox  # the entry is gone
+    assert inject._fut.cancelled()  # settled once: cancelled, never revived
+    assert not host._fut.done()  # cancelling an inject does not touch its host
+
+    gate.set()
+    assert isinstance(await _settled(host), TurnOutcome)
+    assert _names(_terminal(events, "host")) == ["TurnEnded"]
+    # An inject binds no slots of its own, so its own cancellation is silent --
+    # a terminal event here would announce an end on the host's lane while the
+    # host is still going.
+    assert _terminal(events, "inject") == []
+    later = sched.submit(_req(channel="tg", chat_id="1", text="later", turn_id="later"))
+    assert isinstance(await _settled(later), TurnOutcome)  # the lane is still usable
+    assert runner.ran == ["host", "later"]  # the cancelled inject never fell back, never ran
+    _assert_released(lane)
+    assert _worker_error(lane) is None
+
+
+async def test_merged_inject_whose_waiter_was_cancelled_still_lets_the_host_end():
+    # The other half of the mailbox: the inject was drained and chained to the
+    # host, so the host's own finally is its resolver -- and the host's TurnEnded
+    # sits on the far side of that settlement.
+    drained, finish = asyncio.Event(), asyncio.Event()
+    merge = asyncio.Event()
+    outcome = TurnOutcome(usage=Usage(1, 2, 3), explicit_reply=True)
+
+    class DrainThenWaitRunner:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.drained = asyncio.Event()
+
+        async def run(self, req, emit, drain) -> TurnOutcome:
+            self.started.set()
+            await merge.wait()  # the submitter files the inject before the gap it merges at
+            drain()  # merge now: the inject is chained to this host
+            self.drained.set()
+            await finish.wait()
+            return outcome
+
+    runner = DrainThenWaitRunner()
+    events, sink = _recorder()
+    sched = Scheduler(runner, OriginPools(user=1, system=1), sink)
+    host = sched.submit(_req(channel="tg", chat_id="1", text="host", turn_id="host"))
+    await runner.started.wait()
+    inject = sched.submit(_req(channel="tg", chat_id="1", busy=BusyPolicy.INJECT, text="inject", turn_id="inject"))
+    merge.set()
+    await asyncio.wait_for(runner.drained.wait(), timeout=_SETTLE_TIMEOUT)
+    lane = sched._lanes["tg:1"]
+    assert not lane._inject_mailbox  # merged: the mailbox no longer owns it
+
+    inject._fut.cancel()  # the inject's submitter gave up after the merge
+    finish.set()
+    assert await _settled(host) == outcome  # the host ended normally, not by raising
+    assert _names(_terminal(events, "host")) == ["TurnEnded"]  # its report survived the settlement
+    assert inject._fut.cancelled()  # settled once, not re-resolved with the host's outcome
+    later = sched.submit(_req(channel="tg", chat_id="1", text="later", turn_id="later"))
+    assert isinstance(await _settled(later), TurnOutcome)  # the lane is still usable
+    _assert_released(lane)
+    assert _worker_error(lane) is None
+
+
+async def test_settle_guard_passes_through_an_unrelated_invalid_state():
+    # The guard is not a blanket suppress: an InvalidStateError on a future that
+    # is NOT done is a real defect -- a resolver holding a future it does not own
+    # -- and must still reach the caller rather than be swallowed as settled.
+    class Wrong:
+        """A stand-in whose done() lies: done, but not actually settled."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def done(self) -> bool:
+            return True
+
+        def set_result(self, value) -> None:
+            self.calls += 1
+            raise asyncio.InvalidStateError
+
+    already_terminal = Wrong()
+    _settle(already_terminal, None)  # short-circuits on done(): never reaches set_result
+    assert already_terminal.calls == 0
+
+    class Unowned:
+        """A future that is not done and still refuses to be settled: the second
+        failure mode, and the one the guard must not swallow."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def done(self) -> bool:
+            return False
+
+        def set_result(self, value) -> None:
+            self.calls += 1
+            raise asyncio.InvalidStateError
+
+    unowned = Unowned()
+    with pytest.raises(asyncio.InvalidStateError):
+        _settle(unowned, None)
+    assert unowned.calls == 1  # raised out, not swallowed as settled

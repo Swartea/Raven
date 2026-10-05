@@ -107,6 +107,37 @@ def _gate(size: int) -> "asyncio.Semaphore | _Unbounded":
     return asyncio.Semaphore(size) if size > 0 else _Unbounded()
 
 
+def _settle(fut: asyncio.Future, value: object) -> None:
+    """Give a turn's future its terminal value, unless it is already terminal.
+
+    Every resolution path below is reached by something that is not the future's
+    waiter -- a /stop, a shutdown drain, an inject's host turn -- and any of them
+    can find the future already cancelled. A consumer that awaited
+    ``TurnHandle.result()`` inside a task and was itself cancelled (a CLI
+    interrupt, an aborted gateway request) cancels the future it was awaiting, and
+    the lane's own resolver then meets a dead future. ``set_result`` on that
+    raises ``InvalidStateError``, and where it sits it is the worst place to raise:
+    inside the lane worker's ``finally``, so the worker died mid-loop, the queue
+    stopped draining, the inject mailbox stopped falling back, and the turn's slot
+    was never released.
+
+    Settled exactly once instead: a future that is already terminal is left alone,
+    and a ``set_result`` that lost the same race counts as settled too. Not a
+    blanket suppress -- an ``InvalidStateError`` on a future that is *not* done is
+    a real defect (a resolver holding a future it does not own) and is re-raised.
+    The check sits against the ``set_result`` with no await between them, which is
+    what makes it a guard rather than a hope: nothing can cancel the future in
+    between, so the re-raise can only ever mean the second thing.
+    """
+    if fut.done():
+        return
+    try:
+        fut.set_result(value)
+    except asyncio.InvalidStateError:
+        if not fut.done():
+            raise
+
+
 class OriginPools:
     """Per-origin concurrency gates: a USER pool and a system pool for proactive
     origins, sized independently. No global cap (total concurrency is their sum)
@@ -246,8 +277,11 @@ class Lane:
                     # and submit the next turn while the consumer still holds this
                     # turn's slots -- the phantom rejection turn.cancel's drain step
                     # exists to rule out. In a finally so a sink that raises still
-                    # cannot leave that caller waiting forever.
-                    fut.set_result(None)
+                    # cannot leave that caller waiting forever. Settled through the
+                    # guard, not set_result: the sink call above is an await, and
+                    # this caller's own future can be cancelled across it, so the
+                    # set_result that follows can lose the race it just checked.
+                    _settle(fut, None)
                 return
         for i, (_req, pending_inject) in enumerate(self._inject_mailbox):
             if pending_inject is fut:
@@ -259,7 +293,7 @@ class Lane:
                 # event here would only announce an end on the host turn's lane
                 # while the host is still going.
                 del self._inject_mailbox[i]
-                fut.set_result(None)
+                _settle(fut, None)
                 return
         if fut is self._running_fut and self._run_task is not None and not self._run_task.done():
             self._run_task.cancel()
@@ -296,11 +330,16 @@ class Lane:
         stopped = 0
         while self._pending:
             _req, fut = self._pending.popleft()
-            fut.set_result(None)  # a queued turn never ran: resolve as cancelled
+            # A queued turn never ran: resolve as cancelled. Guarded, because the
+            # entry outlives its waiter's interest: a submitter that was cancelled
+            # while the turn sat in the queue has already taken this future with
+            # it, and the drain below is the path that would then raise out of
+            # shutdown's own phase 2.
+            _settle(fut, None)
             stopped += 1
         while self._inject_mailbox:
             _req, fut = self._inject_mailbox.popleft()
-            fut.set_result(None)  # undrained inject: resolve cancelled, no revival
+            _settle(fut, None)  # undrained inject: resolve cancelled, no revival
             stopped += 1
         return stopped
 
@@ -387,8 +426,13 @@ class Lane:
             finally:
                 # Sole resolver: resolve on every exit, including a cancel that
                 # lands before the task body (and its handlers) ever runs. (A
-                # merged inject is resolved inside _run_turn, not here.)
-                fut.set_result(outcome)
+                # merged inject is resolved inside _run_turn, not here.) Guarded,
+                # because the worker's own await above is a suspension point a
+                # cancelled waiter can use: the submitter's task going away takes
+                # this future with it, and an unguarded set_result here would raise
+                # out of this finally and kill the worker mid-drain, stranding the
+                # rest of the queue and the mailbox fallback below.
+                _settle(fut, outcome)
                 # An inject the turn never drained falls back to a fresh APPEND
                 # turn (no message lost); USER injects log the fallback so a
                 # silent "why didn't my inject inject" is debuggable.
@@ -521,8 +565,12 @@ class Lane:
             # A drained inject shares this turn's outcome -- None on cancel, and
             # None on failure too, because the local is only ever the runner's own
             # return; resolved here, in the turn that merged it, not by the worker.
+            # Guarded like the worker's own settlement: merging happened at the
+            # runner's tool-loop gap, so an inject whose submitter was cancelled
+            # since is already terminal, and raising here would take the host turn's
+            # TurnEnded down with it.
             for inject_fut in chained:
-                inject_fut.set_result(outcome)
+                _settle(inject_fut, outcome)
         latency_ms = (time.monotonic() - run_start) * 1000
         await self._sink(
             TurnEnded(
